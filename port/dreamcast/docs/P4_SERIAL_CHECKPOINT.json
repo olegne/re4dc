@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-09",
+  "repository": "olegne/re4dc",
+  "upstream": "lamb2k/re4dc",
+  "upstream_branch": "dreamcast-port",
+  "branch": "diag/p4-serial-capture",
+  "base_commit": "0770815fb05c0541f00e340713074221c321781b",
+  "status": "documentation_only",
+  "runtime_changed": false,
+  "game_build_produced": false,
+  "physical_capture_validated_for_re4": false,
+  "performance_gain_measured": false,
+  "upstream_pull_request": null,
+  "next_steps": [
+    "Implement an opt-in bounded serial export of the existing RAM ring without recursive dbgio output.",
+    "Test ordering, wrap, overrun accounting, serial backpressure and termination behavior.",
+    "Qualify code/data/heap changes with the inherited build and source/movie gates.",
+    "Measure diagnostics off/on and confirm a complete capture on a physical Dreamcast.",
+    "Develop one optimization per branch and attach matched A/B evidence before proposing it upstream."
+  ],
+  "future_bot_prerequisites": [
+    "Validated bidirectional serial transport",
+    "Explicit diagnostic input receiver including both sticks and movie input",
+    "Wall-clock fail-neutral lease, STOP and physical override",
+    "Normal route testing with DBG_WARP disabled"
+  ]
+}

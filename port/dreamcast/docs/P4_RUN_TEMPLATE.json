@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "is_template": true,
+  "session_id": null,
+  "evidence_kind": null,
+  "arm": null,
+  "source_commit": null,
+  "executable_sha256": null,
+  "toolchain_identity": null,
+  "kos_commit": null,
+  "resolved_knobs_sha256": null,
+  "assets_manifest_sha256": null,
+  "save_sha256": null,
+  "hardware": {
+    "console_revision": null,
+    "boot_method": null,
+    "video_mode": null,
+    "controller": null,
+    "p4_firmware_sha256": null,
+    "dc_p4_baud": null,
+    "p4_pc_baud": null
+  },
+  "test": {
+    "route": null,
+    "start_condition": null,
+    "end_condition": null,
+    "cold_boot": null,
+    "warmup_seconds": null,
+    "measured_seconds": null,
+    "repetition": null,
+    "pacing_mode": null,
+    "serial_export_enabled": null,
+    "dbg_warp_enabled": null
+  },
+  "results": {
+    "fps_mean": null,
+    "game_speed_percent": null,
+    "cpu_phase_ms": null,
+    "pvr_render_mean_ms": null,
+    "pvr_render_max_ms": null,
+    "queue_wait_mean_ms": null,
+    "peak_memory_bytes": null,
+    "ring_overrun_bytes": null,
+    "uart_loss_report": null,
+    "capture_event_metadata_dropped": null,
+    "source_gate": null,
+    "required_decisions_gate": null,
+    "movie_memory_gate": null,
+    "visual_audio_checks": null,
+    "failure": null,
+    "last_room_tick": null
+  },
+  "evidence": {
+    "raw_log_sha256": null,
+    "summary_sha256": null,
+    "reviewed_public_excerpt": null
+  },
+  "notes": "Manual template, not a measured result. Null means unrecorded, not zero."
+}
