@@ -4,9 +4,11 @@ Checkpoint: 2026-10-09. Branch: `diag/p4-serial-capture` in `olegne/re4dc`.
 
 ## Status and scope
 
-This is a documentation-only starting point. It does not enable serial output,
-remote input, a bot, or a new play build. No performance improvement or physical
-acceptance is claimed. Runtime and build defaults are unchanged.
+The opt-in `SERIAL_LOG=1` implementation now exports the existing RAM log to
+UART. It is default-off and has passed focused host tests and isolated SH-4
+compilation. No full game image, physical RE4 capture or FPS improvement has
+been validated at this checkpoint. Remote input and route bots remain future
+work. See [implementation and validation](P4_SERIAL_IMPLEMENTATION.md).
 
 The fork and upstream `dreamcast-port` were both at
 `0770815fb05c0541f00e340713074221c321781b` when this branch was created. That commit
@@ -44,16 +46,18 @@ selects the `re4ring` dbgio handler and clears `re4dc_log_console`.
 The handler's read path returns -1; it is not a serial command receiver.
 Turning `re4dc_log_console` back on can route output back into the ring.
 
-The next implementation should export the existing ring through an independent,
-bounded serial sink. Preserve the ring, its writers and the crash screen; avoid
-recursive stdout and blocking UART work in an interrupt handler. Define explicit
-wrap/overrun accounting and a maximum byte/time budget per drain. Measure actual
-cost instead of assuming that asynchronous capture is free. Include build,
-sequence, room/generation, game tick and monotonic clock identities where available.
+The exporter uses an independent serial sink, with at most 16 currently free
+FIFO slots per poll, without calling KOS blocking TX functions. It preserves the
+ring and crash screen. Serial diagnostics select the existing IRQ-atomic log
+writer so nested producers cannot corrupt the head counter. This adds IRQ cost
+that requires measurement. An independent drain thread sleeps between polls;
+its actual cadence depends on KOS scheduling. It can lose older logs under load
+and reports observed cumulative loss. It is not a lossless capture guarantee.
 
-Fault paths can disable interrupts and halt. A normal drain thread is insufficient
-for the final fault report: qualify a bounded polling fallback separately, while
-retaining the existing on-screen report. Do not add reset or reboot behavior.
+Build identity, monotonic milliseconds, ring counters and stage are emitted as
+`[RE4SER ...]` notices. Existing game log records may supply room/tick details;
+the exporter does not invent missing telemetry. A terminal fault tries a bounded
+final export of up to 2,048 unsent bytes, then retains the original halt behavior.
 
 ## Evidence collected by the PC
 
@@ -124,8 +128,9 @@ candidate identities, reproduction commands, all A/B runs, instrumentation cost,
 source/visual checks and physical findings. Separate confirmed observations from
 causal hypotheses. Keep diagnostics default-off unless separately justified.
 An instrumentation PR may be useful without an FPS gain, but must demonstrate
-correctness, bounded cost and useful evidence. This branch has neither result yet.
+correctness, bounded cost and useful evidence. Host control-flow checks have
+passed; full-image memory/source gates, timing and physical evidence are pending.
 
-Next work is the bounded ring-to-serial implementation and its focused tests,
-followed by target validation. Do not open a performance PR based solely on
-the host collector's tests or this documentation checkpoint.
+Next work is a matched full-image diagnostics-off/on build with the current
+private assets, then the inherited source/memory/movie gates and physical P4
+capture. Do not open a performance PR based solely on the host tests.

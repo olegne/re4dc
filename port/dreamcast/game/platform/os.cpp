@@ -22,6 +22,7 @@
 
 #include "re4dc_platform.h"
 #include "pc_sampler.h"
+#include "serial_log.h"
 
 typedef signed char s8;
 typedef unsigned char u8;
@@ -123,6 +124,7 @@ void OSPanic(const char* file, int line, const char* msg, ...)
     fflush(stdout);
     re4dc_set_stage(0xDEAD0001ul);
     irq_disable();
+    re4dc_serial_log_emergency();
     for (;;) {
     }
 }

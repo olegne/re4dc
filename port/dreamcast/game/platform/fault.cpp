@@ -8,6 +8,7 @@
 #include <stdio.h>
 
 #include "re4dc_platform.h"
+#include "serial_log.h"
 
 extern "C" void re4dc_log_raw(const char* data, unsigned long len);
 extern "C" int re4dc_log_console;
@@ -64,6 +65,7 @@ static void onFault(irq_t code, irq_context_t* ctx, void* data)
     re4dc_crash_screen_fault((unsigned) code, (unsigned long) ctx->pc, (unsigned long) ctx->pr,
                              *(volatile unsigned long*) 0xff00000c);  // TEA: the faulting data address
 #endif
+    re4dc_serial_log_emergency();
     for (;;) {
     }
 }
@@ -81,6 +83,7 @@ extern "C" void re4dc_halt(const char* file, int line)
 #if RE4DC_CRASH_SCREEN
     re4dc_crash_screen_halt(file, line);
 #endif
+    re4dc_serial_log_emergency();
     for (;;) {
     }
 }
@@ -94,6 +97,7 @@ extern "C" void re4dc_fault_init(void)
     irq_set_handler(EXC_UNHANDLED_EXC, onFault, NULL);
     irq_set_handler(EXC_DOUBLE_FAULT, onFault, NULL);
     re4dc_log("re4dc_fault_init: dbgio -> ring, unhandled-exception handler set\n");
+    re4dc_serial_log_init();
 #if RE4DC_CRASH_SCREEN
     re4dc_crash_screen_init();
 #endif

@@ -48,7 +48,10 @@
     "movie_memory_gate": null,
     "visual_audio_checks": null,
     "failure": null,
-    "last_room_tick": null
+    "last_room_tick": null,
+    "serial_export_stats": null,
+    "serial_worker_max_poll_us": null,
+    "serial_delivery_verified": null
   },
   "evidence": {
     "raw_log_sha256": null,

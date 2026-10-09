@@ -361,6 +361,7 @@ POISON_RAM ?= 0
 # draws a report (stop kind, PC/PR/stage, threads, newest log lines) into frame buffer 0, for a photo
 # on hardware where the log ring cannot be read. platform/crash_screen.cpp.
 CRASH_SCREEN ?= 0
+include serial_log.mk
 .PHONY: crash-screen-force
 $(OBJDIR)/crash-screen.h: crash-screen-force
 	@mkdir -p $(dir $@)

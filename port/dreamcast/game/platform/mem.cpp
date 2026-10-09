@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "re4dc_platform.h"
+#include "serial_log.h"
 
 struct Re4dcMemLayout re4dc_mem;
 
@@ -160,17 +161,19 @@ unsigned char re4dc_dvd_buff[0x20000] __attribute__((aligned(32)));
 
 // RE4DC_LOG_ATOMIC (LOGIC_TRACE=1 builds, game30.mk): each call appends with interrupts off, so a
 // preemptive thread (the aica sequencer's "aica: t=... note" lines) cannot splice its text into the
-// middle of a trace line (LT/LU/LX/LP are one re4dc_log call each). Release builds keep the plain loop.
+// middle of a trace line (LT/LU/LX/LP are one re4dc_log call each). SERIAL_LOG also
+// requires this: nested producer head++ must not publish a regressed head to the
+// concurrent consumer. Both diagnostic modes need IRQ-cost qualification.
 void re4dc_log_raw(const char* data, unsigned long len)
 {
-#if RE4DC_LOG_ATOMIC
+#if RE4DC_LOG_ATOMIC || RE4DC_SERIAL_LOG
     const int irq = irq_disable();
 #endif
     while (len--) {
         re4dc_logbuf[re4dc_log_head % RE4DC_LOG_SIZE] = *data++;
         re4dc_log_head++;
     }
-#if RE4DC_LOG_ATOMIC
+#if RE4DC_LOG_ATOMIC || RE4DC_SERIAL_LOG
     irq_restore(irq);
 #endif
 }

@@ -1,28 +1,48 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "date": "2026-10-09",
   "repository": "olegne/re4dc",
   "upstream": "lamb2k/re4dc",
   "upstream_branch": "dreamcast-port",
   "branch": "diag/p4-serial-capture",
   "base_commit": "0770815fb05c0541f00e340713074221c321781b",
-  "status": "documentation_only",
-  "runtime_changed": false,
+  "status": "opt_in_export_implemented_target_qualification_pending",
+  "runtime_changed": true,
   "game_build_produced": false,
   "physical_capture_validated_for_re4": false,
   "performance_gain_measured": false,
   "upstream_pull_request": null,
   "next_steps": [
-    "Implement an opt-in bounded serial export of the existing RAM ring without recursive dbgio output.",
-    "Test ordering, wrap, overrun accounting, serial backpressure and termination behavior.",
-    "Qualify code/data/heap changes with the inherited build and source/movie gates.",
-    "Measure diagnostics off/on and confirm a complete capture on a physical Dreamcast.",
-    "Develop one optimization per branch and attach matched A/B evidence before proposing it upstream."
+    "Provide the current private compilation assets and matched route/movie fixture in the build environment.",
+    "Build matched SERIAL_LOG=0/1 images using the pinned recipe and record resolved knobs plus executable hashes.",
+    "Run inherited source/decision, alignment and H2/s30 memory/movie gates, including 340/340 frames and heap_before.",
+    "Measure diagnostics off/on on a physical Dreamcast; verify P4 capture, overrun notices and a controlled terminal-fault report.",
+    "Implement bidirectional diagnostic input only after RX capture qualification; later propose one measured optimization per PR."
   ],
   "future_bot_prerequisites": [
     "Validated bidirectional serial transport",
     "Explicit diagnostic input receiver including both sticks and movie input",
     "Wall-clock fail-neutral lease, STOP and physical override",
     "Normal route testing with DBG_WARP disabled"
-  ]
+  ],
+  "default_serial_log": 0,
+  "implementation_base_commit": "acb9289f198c4c7e4486ce86917605ed395c0059",
+  "validation": {
+    "host_tests_passed": 47,
+    "isolated_sh4_objects": [
+      "serial_log",
+      "fault",
+      "os",
+      "mem"
+    ],
+    "real_makefile_object_compile_passed": true,
+    "off_existing_object_alloc_bytes_match_base": true,
+    "full_image_linked": false,
+    "source_strict_gate": null,
+    "required_decisions_gate": null,
+    "h2_s30_movie_gate": null,
+    "physical_uart_delivery": null,
+    "instrumentation_overhead": null,
+    "report": "P4_SERIAL_IMPLEMENTATION.md"
+  }
 }
