@@ -28,6 +28,9 @@
 //    PlWepHitCheck3 registers a hit) every frame no hit is pending, until its hp is gone. The enemy's
 //    own damage check then runs its death, and whatever the room links to it (SceExecLinkEmDead) runs
 //    as in play: r100's s03 Ganado (id 0x12) -> r100_Sce_zombi_dead -> the ambush + s20.
+//    `kill <em id> <room frame> <room> <kind>` registers that weapon kind instead (cDmgInfo m_Wep): r119's
+//    giant (id 0x2b) loses hp only on the parasite (part 0x3F) or to kind 0xD, which em2b's damage check
+//    turns into hp 0 (the rocket launcher kill of the original game).
 //  - Move: `goto <room frame> x y z [ang]` (first room, up to 4) moves Leon there at or after that
 //    frame, outside events; an area trigger at the spot then fires as when he walks in (r100: area
 //    6 pre-reads s03/s20, area 0xA starts s03), so a fresh room entry (its entry event and call)
@@ -38,11 +41,15 @@
 // /cd/dc/warp.txt (tools/d367/warp.py writes it from a named preset):
 //   room 0x100 | jp 0 | pos x y z | dir 0x8000 | ang <rad> | rsf <room> <bit>... |
 //   scenario <0|1> <hex> | find <hex> | unlock <0|1> <hex> | dead <no>... | inv default | area <no> [dx dz] |
-//   act <frame> <a|b|x|y|start|fwd|back|none|0xMASK> <hold> | arm <frame> <item id> | trg <no> <frame> [room] | kill <id> <frame> [room] |
+//   act <frame> <a|b|x|y|start|fwd|back|none|0xMASK> <hold> | arm <frame> <item id> | trg <no> <frame> [room] | kill <id> <frame> [room [kind]] |
 //   goto <frame> x y z [ang] | dump | name <preset> | late <mask> [tick] [room] (warp_late.h) | entry <n> |
 //   radio <frame> <call no 0..23> (source radio replay, resource-lifetime test only)
 //   god (Leon's life refilled every frame) | alert <frame> (the crowd hunts Leon from that frame of its entry)
 //   fxmode <flags> (EFFECT_PS2_TOGGLE builds: the effect look at load; 1 fade clamp, 2 PS2 haze, 4 PS2 streak)
+//   charbake <variant> [room frame] (CHARBAKE_TOGGLE builds: the character texture variant at load, or switched at
+//   that frame of the first room, as the look toggle switches it at run time; up to 8 timed lines)
+//   lookstep <room frame> (LOOK_TOGGLE builds: the next look preset at that frame of the first room, the call the
+//   X + START chord makes; up to 16 timed lines; issue #11 preset stepping checks)
 //  - Later rooms: `entry <n>` (n >= 2) scopes the `act` / `goto` lines after it to the n-th room entry of the run
 //    (their frames count in that room; the door that leads there is the source's). Without it every act / goto
 //    belongs to the first room, as before. A fixture with entries also logs Leon's placement in those rooms.
@@ -75,10 +82,18 @@ u32 re4dc_vi_retrace_count(void);
 
 int re4dc_fixture_read(const char* path, char* buffer, unsigned size);
 void re4dc_fixture_state(const char* name, int a, int b);  // pad.cpp fixture anchors (overlay)
+#if defined(RE4DC_LOOK_TOGGLE)
+extern "C" void re4dc_look_set(unsigned mode);  // native_static.cpp (post30.mk LOOK_TOGGLE)
+extern "C" void re4dc_look_osd_toggle(void);  // native_static.cpp (post30.mk LOOK_TOGGLE)
+extern "C" void re4dc_look_cycle(void);  // native_static.cpp (post30.mk LOOK_TOGGLE)
+#endif
 #if defined(RE4DC_EFFECT_PS2_TOGGLE) && RE4DC_EFFECT_PS2_TOGGLE
 void re4dc_ps2fx_set(unsigned flags);  // esp_sub.cpp (effects30.mk EFFECT_PS2_TOGGLE)
 #endif
 }
+#if defined(RE4DC_CHARBAKE_TOGGLE) && RE4DC_CHARBAKE_TOGGLE
+extern "C" void re4dc_charbake_set(unsigned variant);  // coarse_actor.cpp (charbake.mk CHARBAKE_TOGGLE)
+#endif
 
 namespace {
 struct Act { u32 frame; u16 buttons; s8 stick; u16 hold; u8 entry; };
@@ -114,6 +129,7 @@ struct Warp {
     int kill_id;
     u32 kill_frame, kill_hits;
     u16 kill_room;  // 0: any room
+    u8 kill_kind;   // cDmgInfo kind of each hit (1: handgun)
     cEm* kill_em;   // the target once found (kept until its hp is gone)
     u32 kill_watch; // after the kill: state lines left
     struct Goto { u32 frame; f32 pos[3]; f32 ang; bool has_ang, done; u8 entry; } go[4];
@@ -130,6 +146,12 @@ struct Warp {
     u32 census[6];
     bool census_done[6];
     unsigned n_census;
+#if defined(RE4DC_CHARBAKE_TOGGLE) && RE4DC_CHARBAKE_TOGGLE
+    struct CharbakeAt { u32 frame; u8 variant; bool done; } charbake_at[8];  // charbake <variant> <room frame>
+    unsigned n_charbake_at;
+    struct LookStep { u32 frame; bool done; } lookstep[16];  // lookstep <room frame> (LOOK_TOGGLE)
+    unsigned n_lookstep;
+#endif
     bool act_source_clock;  // opt-in fixture holds count source pad ticks, not wall-time stalls
     u8 parse_entry, max_entry;  // `entry <n>`: the room entry later act / goto lines belong to (1 = first room)
 #if RE4DC_WARP_JUMP
@@ -271,6 +293,7 @@ void load()
             wp.kill_id = (int) num(tok[1]);
             wp.kill_frame = num(tok[2]);
             wp.kill_room = n >= 4 ? (u16) num(tok[3]) : 0;
+            wp.kill_kind = n >= 5 ? (u8) num(tok[4]) : 1;
         } else if (!strcmp(k, "goto") && n >= 5 && wp.n_go < 4) {
             Warp::Goto& g = wp.go[wp.n_go++];
             g.entry = wp.parse_entry;
@@ -298,6 +321,14 @@ void load()
             wp.has_alert = true;
             wp.alert_frame = num(tok[1]);
             wp.alert_entry = wp.parse_entry;
+#if defined(RE4DC_LOOK_TOGGLE)
+        } else if (!strcmp(k, "look") && n >= 2) {
+            re4dc_look_set(num(tok[1]));   // post30.mk LOOK_TOGGLE: the look preset at load (gallery columns)
+        } else if (!strcmp(k, "lookosd")) {
+            re4dc_look_osd_toggle();       // LOOK_TOGGLE: the on-screen preset label always shown (label checks)
+        } else if (!strcmp(k, "lookstep") && n >= 2 && wp.n_lookstep < 16) {
+            wp.lookstep[wp.n_lookstep++] = {num(tok[1]), false};   // LOOK_TOGGLE: next preset at a room frame
+#endif
         } else if (!strcmp(k, "freeze") && n >= 2) {
             wp.has_freeze = true;
             wp.freeze_tick = num(tok[1]);
@@ -310,6 +341,12 @@ void load()
             wp.late_mask = num(tok[1]);
             wp.late_tick = n >= 3 ? num(tok[2]) : 1400;
             wp.late_room = n >= 4 ? (u16) num(tok[3]) : 0x100;
+#if defined(RE4DC_CHARBAKE_TOGGLE) && RE4DC_CHARBAKE_TOGGLE
+        } else if (!strcmp(k, "charbake") && n >= 2) {
+            // charbake.mk CHARBAKE_TOGGLE: the character variant at load, or at a room frame of the first room
+            if (n < 3) re4dc_charbake_set(num(tok[1]));
+            else if (wp.n_charbake_at < 8) wp.charbake_at[wp.n_charbake_at++] = {num(tok[2]), (u8) num(tok[1]), false};
+#endif
         } else {
             re4dc_log("warp: unknown line '%s'\n", k);
         }
@@ -405,7 +442,7 @@ void kill_poll()
     YARARE_INFO* part = emSphereAtCk(em, &c, &c, 5000.0f, 1, 5000.0f);
     if (!part) part = &em->hitInfo;
     Vec from = pPL ? pPL->pos : em->pos;
-    em->dmg.set(0, 10, 1, &from, part->rad, part);
+    em->dmg.set(0, 10, wp.kill_kind, &from, part->rad, part);
     ++wp.kill_hits;
 }
 
@@ -649,6 +686,24 @@ void re4dc_warp_poll(void)
             warp_heap4_census((unsigned) wp.room_frames);
         }
     }
+#if defined(RE4DC_CHARBAKE_TOGGLE) && RE4DC_CHARBAKE_TOGGLE
+    for (unsigned i = 0; i < wp.n_charbake_at; ++i) {
+        Warp::CharbakeAt& c = wp.charbake_at[i];
+        if (c.done || wp.room_frames < c.frame) continue;
+        c.done = true;
+        re4dc_log("warp: charbake %u at room frame %u\n", (unsigned) c.variant, (unsigned) wp.room_frames);
+        re4dc_charbake_set(c.variant);
+    }
+#endif
+#if defined(RE4DC_LOOK_TOGGLE)
+    for (unsigned i = 0; i < wp.n_lookstep; ++i) {
+        Warp::LookStep& s = wp.lookstep[i];
+        if (s.done || wp.room_frames < s.frame) continue;
+        s.done = true;
+        re4dc_log("warp: lookstep at room frame %u\n", (unsigned) wp.room_frames);
+        re4dc_look_cycle();
+    }
+#endif
     for (unsigned i = 0; i < wp.n_arm; ++i) {
         Warp::ArmItem& a = wp.arm[i];
         if (a.done || wp.room_frames < a.frame) continue;

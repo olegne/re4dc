@@ -28,6 +28,10 @@ extern "C" int re4dc_fixture_read(const char* path, char* buffer, unsigned size)
 extern "C" void re4dc_halt(const char* file, int line);
 extern "C" void re4dc_task_brief(char* out, unsigned size, const void* wait);  // scheduler.cpp
 extern "C" void re4dc_subscreen_brief(char* out, unsigned size) __attribute__((weak));
+extern "C" int pvr_present_pending(void) __attribute__((weak));
+#if RE4DC_PVR_LATCH
+extern "C" int re4dc_pvr_latch_line(unsigned which, char* out, unsigned size) __attribute__((weak));  /* native_ui.cpp */ extern "C" void re4dc_pvr_ready_test_arm(int slices) __attribute__((weak));  // PVR_READY_STRICT; one line: keeps __LINE__
+#endif
 static const unsigned kLogSize = 0x10000;  // mem.cpp RE4DC_LOG_SIZE
 
 namespace {
@@ -39,6 +43,62 @@ unsigned short* g_fb;  // the frame buffer being scanned out (FB_R_SOF1), as vid
 volatile int g_shown;
 kthread_t* g_threads[24];
 int g_nthreads;
+
+// First-failure state survives the 30-second watchdog delay. In issue 9 the
+// missing handler's deliberate sleep obscured a presentation timeout. Current
+// versus captured frame/vblank counts also show whether PVR later completed.
+struct MissingSnapshot {
+    char reason[80];
+    unsigned ui, frames, vbl, vtx[3], opb[3], isp;
+    unsigned asic[3], opb_init;  // issue 9: raw ASIC event status A/B/C (latched even when not enabled)
+#if RE4DC_PVR_LATCH
+#if RE4DC_PVR_LATCH >= 2
+    char latch[6][54];           // latch v2: rows 0..5 (state, totals, ring, rdy, er/max, last two scenes)
+#else
+    char latch[4][54];           // re4dc_pvr_latch_line 0..3 at the failure (one screen row each)
+#endif
+#endif
+    int pending, ta_ready;
+    bool valid, pvr_valid;
+};
+MissingSnapshot g_missing{};
+
+void capture_missing(const char* name)
+{
+    const int old = irq_disable();
+    if (!g_missing.valid) {
+        snprintf(g_missing.reason, sizeof(g_missing.reason), "%s", name ? name : "unknown");
+        g_missing.ui = re4dc_ui_frame();
+        pvr_stats_t st{};
+        g_missing.pvr_valid = pvr_get_stats(&st) == 0;
+        if (g_missing.pvr_valid) {
+            g_missing.frames = st.frame_count;
+            g_missing.vbl = st.vbl_count;
+            g_missing.pending = pvr_present_pending ? pvr_present_pending() : -1;
+            g_missing.ta_ready = pvr_check_ready();
+            g_missing.vtx[0] = PVR_GET(PVR_TA_VERTBUF_START);
+            g_missing.vtx[1] = PVR_GET(PVR_TA_VERTBUF_POS);
+            g_missing.vtx[2] = PVR_GET(PVR_TA_VERTBUF_END);
+            g_missing.opb[0] = PVR_GET(PVR_TA_OPB_START);
+            g_missing.opb[1] = PVR_GET(PVR_TA_OPB_POS); // raw register; word units on hardware
+            g_missing.opb[2] = PVR_GET(PVR_TA_OPB_END);
+            g_missing.isp = PVR_GET(PVR_ISP_VERTBUF_ADDR);
+            g_missing.opb_init = PVR_GET(PVR_TA_OPB_INIT);
+            // A pending render-done bit (A bit 2) means the interrupt was lost; C bits 0..4 are
+            // ISP out of memory, strip halt, OPB out of memory, TA input error, TA input overflow.
+            g_missing.asic[0] = *(volatile uint32_t*) ASIC_ACK_A;
+            g_missing.asic[1] = *(volatile uint32_t*) ASIC_ACK_B;
+            g_missing.asic[2] = *(volatile uint32_t*) ASIC_ACK_C;
+#if RE4DC_PVR_LATCH
+            for (unsigned i = 0; i < sizeof(g_missing.latch) / sizeof(g_missing.latch[0]); ++i)
+                if (!re4dc_pvr_latch_line || !re4dc_pvr_latch_line(i, g_missing.latch[i], sizeof(g_missing.latch[i])))
+                    g_missing.latch[i][0] = 0;
+#endif
+        }
+        g_missing.valid = true;
+    }
+    irq_restore(old);
+}
 
 int collect(kthread_t* t, void*)
 {
@@ -107,6 +167,46 @@ void show(const char* kind, const char* detail, bool wait_render)
     put_text(0, row++, line, 0xF800);
     snprintf(line, sizeof(line), "stage %08lx  ui frame %u", re4dc_stage, re4dc_ui_frame());
     put_text(0, row++, line, 0xFFFF);
+#if RE4DC_PVR_LATCH
+    // PVR_LATCH: the same snapshot in two rows, then the latch rows (state, totals, event ring) captured at the
+    // first failure; a hang without a failure prints the latch rows as they are now.
+    if (g_missing.valid && g_missing.pvr_valid) {
+        pvr_stats_t st{};
+        pvr_get_stats(&st);
+        snprintf(line, sizeof(line), "snap ui%u p%d ta%d pvr %u/%u vb %u/%u", g_missing.ui, g_missing.pending,
+                 g_missing.ta_ready, g_missing.frames, (unsigned) st.frame_count, g_missing.vbl,
+                 (unsigned) st.vbl_count);
+        put_text(0, row++, line, 0xFFFF);
+        snprintf(line, sizeof(line), "v%06x/%06x/%06x o%06x/%06x/%06x i%06x", g_missing.vtx[0], g_missing.vtx[1],
+                 g_missing.vtx[2], g_missing.opb[0], g_missing.opb[1], g_missing.opb[2], g_missing.isp);
+        put_text(0, row++, line, 0xFFFF);
+        for (unsigned i = 0; i < sizeof(g_missing.latch) / sizeof(g_missing.latch[0]); ++i)
+            if (g_missing.latch[i][0]) put_text(0, row++, g_missing.latch[i], 0x07FF);
+    } else if (re4dc_pvr_latch_line) {
+        for (unsigned i = 0; i < sizeof(g_missing.latch) / sizeof(g_missing.latch[0]); ++i)
+            if (re4dc_pvr_latch_line(i, line, sizeof(line) < 54 ? sizeof(line) : 54)) put_text(0, row++, line, 0x07FF);
+    }
+#else
+    if (g_missing.valid && g_missing.pvr_valid) {
+        pvr_stats_t st{};
+        pvr_get_stats(&st);
+        snprintf(line, sizeof(line), "snap ui%u pending%d ta%d", g_missing.ui,
+                 g_missing.pending, g_missing.ta_ready);
+        put_text(0, row++, line, 0xFFFF);
+        snprintf(line, sizeof(line), "pvr %u/%u vb %u/%u", g_missing.frames, (unsigned)st.frame_count,
+                 g_missing.vbl, (unsigned)st.vbl_count);
+        put_text(0, row++, line, 0xFFFF);
+        snprintf(line, sizeof(line), "vtx %06x/%06x/%06x isp %06x", g_missing.vtx[0],
+                 g_missing.vtx[1], g_missing.vtx[2], g_missing.isp);
+        put_text(0, row++, line, 0xFFFF);
+        snprintf(line, sizeof(line), "opb %06x/%06x/%06x (pos raw)", g_missing.opb[0],
+                 g_missing.opb[1], g_missing.opb[2]);
+        put_text(0, row++, line, 0xFFFF);
+        snprintf(line, sizeof(line), "asic %08x %08x %08x opbi %06x", g_missing.asic[0],
+                 g_missing.asic[1], g_missing.asic[2], g_missing.opb_init);
+        put_text(0, row++, line, 0xFFFF);
+    }
+#endif
     if (re4dc_subscreen_brief) {
         re4dc_subscreen_brief(line, sizeof(line));
         if (line[0]) put_text(0, row++, line, 0xFFFF);
@@ -218,13 +318,14 @@ void* watchdog(void*)
         }
         if (++still == 30) {
             re4dc_log("CRASH_SCREEN: no new frame for 30 s (ui frame %u)\n", ui);
-            show("HANG", "no new frame for 30 s", false);
+            show(g_missing.valid ? "MISSING" : "HANG",
+                 g_missing.valid ? g_missing.reason : "no new frame for 30 s", false);
         }
     }
     return nullptr;
 }
 
-// Test hook: /cd/dc/crashtest.txt ("fault", "halt", "hang", "block" or "sleep") stops the game that way 20 s after boot,
+// Test hook: /cd/dc/crashtest.txt ("fault", "halt", "hang", "block", "sleep" or "missing") stops the game that way 20 s after boot,
 // so the report can be checked in Flycast. The file is never on a play disc.
 int g_test;
 }  // namespace
@@ -250,7 +351,19 @@ void* crash_test(void*)
     } else if (g_test == 5) {
         re4dc_log("CRASH_SCREEN test: main timed sleep\n");
         re4dc_crashtest_block = 2;  // the next main-thread signal sleeps, preserving a real saved caller
+    } else if (g_test == 6) {
+        re4dc_crashtest_block = 1;
+        re4dc_missing("native stream completion fence failed");
     }
+#if RE4DC_PVR_LATCH
+    else if (g_test == 7 && re4dc_pvr_ready_test_arm) {
+        // PVR_READY_STRICT: three scenes each see one expired TA-bank slice, then the stop screen (rdy row).
+        re4dc_pvr_ready_test_arm(3);
+        thd_sleep(3000);
+        re4dc_crashtest_block = 1;  // as "missing": the game then stops, so the watchdog draws the screen
+        re4dc_missing("crash test: PVR ready wait");
+    }
+#endif
     return nullptr;
 }
 }  // namespace
@@ -281,7 +394,10 @@ extern "C" void re4dc_crash_screen_init(void)
     char t[16] = {0};
     if (re4dc_fixture_read("/cd/dc/crashtest.txt", t, sizeof(t) - 1) > 0) {
         g_test = !strncmp(t, "fault", 5) ? 1 : !strncmp(t, "halt", 4) ? 2 : !strncmp(t, "hang", 4) ? 3
-                 : !strncmp(t, "block", 5) ? 4 : !strncmp(t, "sleep", 5) ? 5 : 0;
+                 : !strncmp(t, "block", 5) ? 4 : !strncmp(t, "sleep", 5) ? 5 : !strncmp(t, "missing", 7) ? 6 : 0;
+#if RE4DC_PVR_LATCH
+        if (!g_test && !strncmp(t, "pvrwait", 7)) g_test = 7;
+#endif
         kthread_attr_t b = {};
         b.stack_size = 4096;
         b.prio = 9;
@@ -304,6 +420,11 @@ extern "C" void re4dc_crash_screen_halt(const char* file, int line)
     const char* base = file ? strrchr(file, '/') : nullptr;
     snprintf(d, sizeof(d), "%s(%d)", base ? base + 1 : (file ? file : "?"), line);
     show("HALT", d, true);
+}
+
+extern "C" void re4dc_crash_screen_missing(const char* name)
+{
+    capture_missing(name);
 }
 
 #endif

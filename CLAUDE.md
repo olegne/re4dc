@@ -1,5 +1,14 @@
 # RE4 Dreamcast working handoff
 
+2026-10-09 issues 9 and 15: the crash screen adds an `asic` line (ASIC_ACK_A/B/C,
+TA_OPB_INIT) to the first-failure snapshot; disc streams decode with the SND_SHD
+coefficient order (battle music and radio voices no longer saturate); prebuilt
+banks use an anti-alias decimator (aica_banks.py decimate_aa, same sizes; refilter
+an existing disc with `aica_banks.py reconvert`). H2/bell STRICT, s30, calls, New
+Game and the inventory set pass in Flycast. A GDEMU test package was built; no
+release or SD write. TA_GUARD=1 was not used (it changes drawing). See
+[route doc](port/dreamcast/docs/D367_THIRTY_FPS_ROUTE.md) 2026-10-09.
+
 2026-10-08 lamp correction: source owner 0x5e now reaches the existing native
 sprite filter. The matched r102 impact shows flame/smoke, with 2,795 STRICT
 source records and identical required decisions. Paired drawn hardware-model
@@ -174,6 +183,39 @@ loads every texture package from one file (room entry 7.2 -> 3.1 s, east walk 6.
 - r21y (564f5168; route doc "r21y"): r21x + the camera fix (cCamera destructors memset(this, 9, 0x200) and four
   end* paths left `extra` set -> the next `delete extra` faulted on the console at the r100 window jump; Flycast resets
   silently: treat "log head decreased: reset" as a possible console fault) + the VMU CPU line as %. Released play-r21y-camera-fix-20261004 (the only release page now).
+- r10b (2026-10-10, route doc "r10b", ROUTE_CH13): chapter 1-3 ends at r10b; pl0f / em2f are heap-4 room overlays
+  (ROUTE_OVL: tools/link.sh multi-overlay, platform/modules.cpp loader); play discs must stage dc/pl0f.ovl +
+  dc/em2f.ovl (checklist 2026-10-10).
+- r11b (2026-10-10, route doc "r11b", ROUTE_CH21 needs ROUTE_OVL): chapter 2-1 starts in r11b after the r10b save;
+  em22 is a room overlay (stage dc/em22.ovl); stage the le_mirror'd etc/emleon01.esl (raw on the disc: R11bInit hang).
+- r119 (2026-10-10, route doc "r119"): El Gigante under ROUTE_CH21; em2b is a room overlay (stage dc/em2b.ovl) and
+  must be staged prepared (textures + motion leases, dc/mot keys): the GC body does not fit r119's heap 4.
+- LINK_TIGHT / LINK_OVL_HELPERS (2026-10-10, route doc "LINK_TIGHT", default 1 with ROUTE_CH21): no KOS .sub
+  padding; helpers only one room overlay reaches live in that overlay (obj/ovlh/moves.tsv), so the overlays must
+  come from the same build as the image. MOVIE_FENCE_RETRY: a not-ready fence no longer ends a route movie.
+- ACTOR_EXACT_FAST (2026-10-10, route doc "ACTOR_EXACT_FAST", default 1 with ROUTE_CH21): exact actor lighting
+  with per-light constants hoisted + fsrra (r119 quiet -15.5 hw ms). Torch flicker defeats any light bake.
+- r118 (2026-10-10, route doc "r118", ROUTE_CH21): r119 door 0 -> r118; BGM0 is bgmtbl slot 0 (snd.cpp CH21
+  case); stage the r118 arc/dar/bio4midi #11, aica_str 0:23, PS2 world and the two material pairs.
+- r117 (2026-10-10, route doc "r117", ROUTE_CH21): the chapter 2-1 end. Stage:
+  - dc/pl11.ovl (Ashley, a room overlay; tools/ovl_helpers.py RO moves keep cSubChar out of the image);
+  - em11 prepared (prepare_enemy_motions, dc/mot keys);
+  - the chapter 2-1 end backdrops VQ'd inside dc/tex.pak (pack entries win over loose files).
+  The CH21 aica_str.dat has 17 entries: RE4DC_STR_ENT_MAX=32.
+- r11a (2026-10-10, route doc "r11a"): data only. A room counts as built when dc/native/<room>/ps2-world.r4pw is
+  staged. aica_banks ROOMS r11a reads em24 at room entry.
+- WATER42_GRID_SKIP (2026-10-10, route doc "WATER42_GRID_SKIP", default 1 in the ROUTE_CH13 block): espgen42 (the
+  r10a / r11a lake water) keeps only its plane; the GX-only grid update was ~18 hw ms of r11a logic. Logic reads only
+  the plane; init RNG draws kept. Find a generator's rooms with a le_mirror SEQUENCE_OBSERVER scan (Kind 1, Espgen_id).
+- WATER45_NATIVE (2026-10-10, route doc "r10b lake water", default 1 in the ROUTE_CH13 block): the r10b lake surface
+  as a native PVR multiply queued in OT 0x10 (coarse images too), and the PS2 r10b sprite set (GC mist / backdrop
+  sheets dropped, PS2 haze). Lake view 61.1 -> 51.6 hw ms drawn. Logic STRICT (H2, bell, r10b).
+- Material pair 18d0fd82-2c9a9309 (2026-10-10, route doc "material pair 18d0fd82"): r10b / r11b room model TPL
+  (#27 / #28) color + mask; built by pairs_from_log.py --file st1/r11b.das + VQ, staged by lane r11b mkfix r11b().
+  pack-fixture.sh replaces an existing dc/tex.pak with a pack of the loose files only: merge the catalog pack first.
+- Disc streams (2026-10-10, route doc "stream 1:148"): `aica_banks.py streams --streams ch21` is the chapter 2-1
+  play list (CH21_STREAMS); append new streams at the end so earlier entries stay byte-identical. 0:29 (chapter 1-3
+  results music) is still not in it.
 - Chapter 1-3 (c4ec84e9; route doc "chapter 1-3"): ROUTE_CH13=1, default off; resident-track music in r108/r10a;
   "Coming Soon" at doors into rooms not on the disc. Test disc r21z-c13 awaits the user's console play.
 - User 2026-10-04 "Pursue All": logic speed-ups are unparked (exact, STRICT), alongside the drawing lanes, cheaper

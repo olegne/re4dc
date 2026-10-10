@@ -50,18 +50,91 @@ OBJDIR = obj
 MODULES = st1_0 st1_1 st1_2 st1_3 wep02 em12 em23 em15 em26 em28 em21 em2a em29 em2e em13 em27
 # ROUTE_CH13=1 (route lane c13, default 0: no effect): chapter 1-3's rooms. Links em18 (module 22, the merchant:
 # r102), em17 (21, r108's Ganados; joins the EM10_SHARED group) and em24 (8: r108 / r10a), and r102's s00 is
-# presented by its PS2 movie (src/st1/r102.cpp, route-movies.h RE4DC_ROUTE_CH13).
+# presented by its PS2 movie (src/st1/r102.cpp, route-movies.h RE4DC_ROUTE_CH13). r10b (the lake, chapter 1-3's
+# end): pl0f (module 43, Leon's boat) and em2f (39, Del Lago).
 ROUTE_CH13 ?= 0
 ifneq ($(ROUTE_CH13),0)
 ifneq ($(ROUTE_CH13),1)
 $(error ROUTE_CH13 must be 0 or 1)
 endif
-MODULES += em18 em17 em24
+# ROUTE_OVL=1 (default with ROUTE_CH13=1): r10b's boat (pl0f) and Del Lago (em2f) are room overlays, not
+# resident code: tools/link.sh writes pl0f.ovl / em2f.ovl (as SUBSCREEN_OVL's sscrn.ovl) and strips them from
+# the image; platform/modules.cpp reads one into heap 4 when the game links that module and frees it at the
+# unlink (r10b exit). The resident image stays no larger than without ROUTE_CH13's r10b code.
+ROUTE_OVL ?= 1
+ifeq ($(ROUTE_OVL),1)
+MODULES += em18 em17 em24 pl0f:ovl em2f:ovl
+export RE4DC_LINK_OVERLAY += .ovl_pl0f .ovl_em2f
+$(OBJDIR)/platform/modules.o: PLATFORM_CPPFLAGS += -DRE4DC_ROUTE_OVL=1
+$(OBJDIR)/src/game/game.o: GAME_CPPFLAGS += -DRE4DC_ROUTE_OVL=1
+else
+MODULES += em18 em17 em24 pl0f em2f
+endif
 $(OBJDIR)/platform/modules.o: PLATFORM_CPPFLAGS += -DRE4DC_ROUTE_CH13=1
 # r108 / r10a play their resident BGM0 track for the second room track (src/game/snd.cpp; the BGM1 slot is 0 bytes).
 $(OBJDIR)/src/game/snd.o: GAME_CPPFLAGS += -DRE4DC_ROUTE_CH13=1
+# r10b: espgen45 (the lake height field) keeps hA/hB/pos but skips its GX-only normal/bump/display-list buffers
+# (1.36 MB of heap 4; GX is a stub here: WATER45_NATIVE draws the surface).
+$(OBJDIR)/src/game/espgen45.o: GAME_CPPFLAGS += -DRE4DC_WATER45_LEAN=1
+WATER45_GRID_SKIP ?= 1
+ifeq ($(WATER45_GRID_SKIP),1)
+$(OBJDIR)/src/game/espgen45.o $(OBJDIR)/src/game/Espgen42.o: GAME_CPPFLAGS += -DRE4DC_WATER45_GRID_SKIP=1
+endif
+# r10a / r11a: espgen42 (the room lake water) without its height grid (hA / hB / pos / nrm / bump / display list) or
+# its per-frame update (r11a ~18 hw ms of logic). Logic reads only the plane; the init's shared-RNG draws are kept.
+WATER42_GRID_SKIP ?= 1
+ifeq ($(WATER42_GRID_SKIP),1)
+$(OBJDIR)/src/game/Espgen42.o: GAME_CPPFLAGS += -DRE4DC_WATER42_GRID_SKIP=1
+endif
+# WATER45_NATIVE=1 (default with ROUTE_CH13=1): espgen45 draws the lake surface natively (re4dc_water45_draw: the
+# plane over the grid and far border, the GameCube's scene x TEV colour as a PVR multiply, fogged per corner). Without
+# it nothing draws the water (GX stub, no water mesh in the PS2 world): the fog-coloured background shows (pale lake).
+WATER45_NATIVE ?= 1
+ifeq ($(WATER45_NATIVE),1)
+$(OBJDIR)/src/game/espgen45.o $(OBJDIR)/src/game/espgen.o $(OBJDIR)/src/game/trans.o $(OBJDIR)/src/game/esp_sub.o: GAME_CPPFLAGS += -DRE4DC_WATER45_NATIVE=1
+$(OBJDIR)/platform/native_ui.o $(OBJDIR)/platform/native_static.o: PLATFORM_CPPFLAGS += -DRE4DC_WATER45_NATIVE=1
+endif
+# em27ObaHitCk scans enemy slots through the sparse backing (workAt) instead of raw slot math, which read an
+# unbacked slot's 0xFF filler as a NaN position and dragged the fish to NaN (r10b dock / boss collision storm).
+$(OBJDIR)/mod/em27/src/em27/em27.o: GAME_CPPFLAGS += -DRE4DC_EM27_SLOT_FIX=1
 # A door into a room the disc does not carry shows "Coming Soon" and holds (route_end.cpp, src/game/sce_at.cpp).
 $(OBJDIR)/src/game/sce_at.o: GAME_CPPFLAGS += -DRE4DC_ROUTE_CH13=1
+# ROUTE_CH21=1 (route lane r11b, default 0: no effect; needs ROUTE_CH13=1 and ROUTE_OVL=1): chapter 2-1 starts in
+# r11b (the lake shore, entered through r10b door 6 after the chapter 1-3 save). em22 (module 5, the wolves of the
+# shore ambush) is a third room overlay (em22.ovl, linked after pl0f / em2f so theirs are unchanged), and r11b's
+# s00 is presented by its PS2 movie (src/st1/r11b.cpp). r11b's own exits lead to rooms this disc does not carry
+# (r11a, r10c, r10d): the ROUTE_CH13 door check shows "Coming Soon".
+ROUTE_CH21 ?= 0
+ifneq ($(ROUTE_CH21),0)
+ifneq ($(ROUTE_CH21)$(ROUTE_OVL),11)
+$(error ROUTE_CH21 must be 0 or 1 and needs ROUTE_OVL=1)
+endif
+MODULES += em22:ovl
+export RE4DC_LINK_OVERLAY += .ovl_em22
+$(OBJDIR)/platform/modules.o: PLATFORM_CPPFLAGS += -DRE4DC_ROUTE_CH21=1
+$(OBJDIR)/mod/st1_2/src/st1/r11b.o: GAME_CPPFLAGS += -DRE4DC_ROUTE_CH21=1
+# r119 (route lane r119, the village square, El Gigante; r11a door 0): em2b (module 30, the giant) is a fourth room
+# overlay (em2b.ovl, linked after em22 so the earlier overlays are unchanged); r119's four events (s00 entrance,
+# s10 the dog, s20 death, s30 the parasite) are presented by their PS2 movies (src/st1/r119.cpp).
+MODULES += em2b:ovl
+export RE4DC_LINK_OVERLAY += .ovl_em2b
+$(OBJDIR)/mod/st1_2/src/st1/r119.o: GAME_CPPFLAGS += -DRE4DC_ROUTE_CH21=1
+$(OBJDIR)/route_movie_bridge.o: GAME_CPPFLAGS += -DRE4DC_ROUTE_CH21=1
+# r118 (route lane r118, the church; r119 door 0): no new module (its entry enemy em22 is r11b's overlay); slot 1's
+# BGM (bio4midi #9) plays on the resident slot-0 track, as r108 / r10a (src/game/snd.cpp).
+$(OBJDIR)/src/game/snd.o: GAME_CPPFLAGS += -DRE4DC_ROUTE_CH21=1
+# r117 (route lane r117, the church interior, chapter 2-1's end; r118 door 4, key 0x3C): Ashley joins (SubCharInit
+# -> enemy module 3 = pl11.rel, module 47, cSubAshley), so pl11 is a fifth room overlay (pl11.ovl, linked after em2b;
+# it is re-read in every room she is in). em11 (module 13, the Ganados R117Init sets on a later visit) joins the
+# EM10_SHARED group (em11_set.cpp only; alone it would carry a second em10.cpp). s00 / s10 are presented by their PS2
+# movies (src/st1/r117.cpp); the chapter end (SceSetChapterEnd(CHAPTER_2_1, -1)) and its save run unchanged.
+MODULES += pl11:ovl em11
+# The CH21 stream file has 17 entries (r118's 0:23): the reader's table takes 32 (it refused the file at 16).
+$(OBJDIR)/platform/audio_aica.o: PLATFORM_CPPFLAGS += -DRE4DC_STR_ENT_MAX=32
+export RE4DC_LINK_OVERLAY += .ovl_pl11
+$(OBJDIR)/mod/st1_3/src/st1/r117.o: GAME_CPPFLAGS += -DRE4DC_ROUTE_CH21=1
+ROUTE_MOVIE_GAME_CH21 = $(OBJDIR)/mod/st1_2/src/st1/r11b.o $(OBJDIR)/mod/st1_2/src/st1/r119.o $(OBJDIR)/mod/st1_3/src/st1/r117.o
+endif
 endif
 # WEAPON_MODULES=1 (issue #1 2026-10-05, default 0: no effect): Leon's other stage-1 weapons, so equipping one in the
 # inventory (SubScreenExit -> ReadWepData -> DLL_Link) finds its module instead of halting "DLL link/unlink failed":
@@ -112,6 +185,12 @@ PRIM_CAP_R107 ?= 0
 ifneq ($(PRIM_CAP_R107),0)
 $(OBJDIR)/src/game/game.o: GAME_CPPFLAGS += -DRE4DC_PRIM_CAP_R107=$(PRIM_CAP_R107)
 endif
+# PRIM_CAP_R10B=<bytes> (default 0: no effect): the same cap for r10b (room value 458,752 B; measured peak 279,808,
+# PRIM_WATER), for the lake boss's heap 4.
+PRIM_CAP_R10B ?= 0
+ifneq ($(PRIM_CAP_R10B),0)
+$(OBJDIR)/src/game/game.o: GAME_CPPFLAGS += -DRE4DC_PRIM_CAP_R10B=$(PRIM_CAP_R10B)
+endif
 # PRIM_WATER=1 (test only): per-room peak primitive-buffer bytes per frame ("prim water:" lines, trans.cpp).
 ifeq ($(PRIM_WATER),1)
 $(OBJDIR)/src/game/trans.o: GAME_CPPFLAGS += -DRE4DC_PRIM_WATER=1
@@ -161,7 +240,11 @@ ifneq ($(EM1F_SHARED)$(WORLD_ROOM_MODULES)$(EM10_SHARED),111)
 $(error EM1F_SHARED must be 0 or 1, and 1 needs WORLD_ROOM_MODULES=1 and EM10_SHARED=1)
 endif
 endif
-EM10_GROUP = $(filter em12 em15 em13 em17 $(if $(filter 1,$(EM1F_SHARED)),em1f),$(MODULES))
+ifeq ($(ROUTE_CH21)$(EM10_SHARED)$(WORLD_STAGE_MODULES),110)
+else ifeq ($(ROUTE_CH21),1)
+$(error ROUTE_CH21=1 needs EM10_SHARED=1 (em11 in the em10g group) and WORLD_STAGE_MODULES=0 (pl11 is a CH21 overlay))
+endif
+EM10_GROUP = $(filter em12 em15 em13 em17 em11 $(if $(filter 1,$(EM1F_SHARED)),em1f),$(MODULES))
 MODULE_ARGS = $(if $(filter 1,$(EM10_SHARED)),$(filter-out $(EM10_GROUP),$(MODULES)) em10g=$(subst $(eval) ,+,$(strip $(EM10_GROUP))),$(MODULES))
 MODULE_OBJS =
 MODULES_MK = $(OBJDIR)/modules.mk
@@ -223,6 +306,18 @@ CROWD_FLAT ?= 0
 # ACTOR_SKIN_FTRV=1: skinned palette matrices (screen x [R*q | t]) built with FTRV instead of
 # scalar maths (render only, native_actor_fast.cpp skin_position_matrix).
 ACTOR_SKIN_FTRV ?= 0
+# ACTOR_EXACT_FAST=1 (render only; default 1 with ROUTE_CH21=1, else 0: no effect): the actor path's exact per-vertex
+# lighting (parts whose lights do not fold into three directions, e.g. r119's trees under up to eight flickering torch
+# lights: ~46 hw ms a frame) with the per-light constants out of the vertex loop and fsrra for the light distance
+# (native_actor_fast.cpp pass_lights_exact); same formula and order, float rounding only.
+ifeq ($(ROUTE_CH21),1)
+ACTOR_EXACT_FAST ?= 1
+else
+ACTOR_EXACT_FAST ?= 0
+endif
+ifeq ($(ACTOR_EXACT_FAST),1)
+$(OBJDIR)/platform/native_actor_fast.o: PLATFORM_CPPFLAGS += -DRE4DC_ACTOR_EXACT_FAST=1
+endif
 ifeq ($(NATIVE_ACTOR)$(NATIVE_ACTOR_FAST),11)
 PLATFORM_OBJS := $(filter-out $(OBJDIR)/platform/native_actor.o,$(PLATFORM_OBJS))
 else
@@ -244,6 +339,17 @@ endif
 # ARAM DMAs complete at the next audio frame, as on the GC, instead of inside the
 # call, so streams go ready -> playing -> ended and scenario waits return.
 GAME_LDFLAGS += -Wl,--wrap=DVDReadAsyncPrio -Wl,--wrap=ARQPostRequest
+# SBB_STUB=1 (default 0: no effect): bgm/bio4bgm.sbb and bgm/bio4evt.sbb (332,890,112 B of GC stream payload)
+# leave the disc. The stream player's reads of them are the wrapped, skipped ones above; platform/dvd.cpp gives
+# both entries their retail size without opening them, so FileTbl entry numbers, DVDFileInfo and every stream
+# state stay as they are. The headers the player uses come from bgm/bio4str.hed (still staged).
+SBB_STUB ?= 0
+ifneq ($(SBB_STUB),0)
+ifneq ($(SBB_STUB),1)
+$(error SBB_STUB must be 0 or 1)
+endif
+$(OBJDIR)/platform/dvd.o: PLATFORM_CPPFLAGS += -DRE4DC_SBB_STUB=1
+endif
 # AICA_STREAMS=1 (default; with AICA_AUDIO=1): streams play from bgm/aica_str.dat
 # (tools/aica_banks.py; a disc without it keeps them silent). 0: silent streams.
 AICA_STREAMS ?= 1
@@ -361,11 +467,30 @@ POISON_RAM ?= 0
 # draws a report (stop kind, PC/PR/stage, threads, newest log lines) into frame buffer 0, for a photo
 # on hardware where the log ring cannot be read. platform/crash_screen.cpp.
 CRASH_SCREEN ?= 0
+# PVR_LATCH=1 (issue 9 hardware diagnosis, default 0; needs CRASH_SCREEN=1, PVR_PIPELINE=2): chained handlers on
+# every PVR ASIC event (list done, render done, the five TA/ISP error events) and thread-side scene marks feed a
+# 64-entry ring, totals and the KOS PVR state, printed on the stop screen in place of the raw asic line (KOS
+# acknowledges all pending ASIC bits on every interrupt, so that line always read zero). Render-only.
+PVR_LATCH ?= 0
+# PVR_READY_STRICT=1 (issue 9 fix, default 0; needs PVR_PIPELINE=2): KOS starts writing the next scene into a TA bank
+# whose previous scene was never handed to a render once pvr_wait_ready()'s 100 ms wait expires (pvr_scene.c
+# pvr_start_ta_rendering ignores the result). Link wraps of pvr_list_begin / pvr_set_presort_mode keep waiting in
+# 100 ms slices (bounded at 10 s) and present_fence does the same for pvr_present_wait; each expired slice is
+# counted (with PVR_LATCH: ring codes K / Q / Y and a "rdy" stop screen row). platform/native_ui.cpp namespace ready.
+PVR_READY_STRICT ?= 0
+# PVR_LATCH=2 (latch v2, issue 9): as 1, plus a run of one ring code collapsed into one entry with a count, all six
+# SB_ISTERR bits with the UI frame each first appeared, and each scene's TA vertex / OPB use at its close (last two
+# scenes and the maximum since boot) on two more stop screen rows.
+# PVR_RECOVER=1 (issue 9 fix, default 0; needs PVR_READY_STRICT=1): a render still busy after 1 s (100 ms after a
+# render error) is reset (PVR soft reset of the ISP/TSP) and completed through the render-done handler chain in the
+# next vblank, its frame dropped; a scene whose list-done events never all arrive gets them (TA reset first after a
+# TA error). Stop screen after 8 recoveries in a row. platform/native_ui.cpp namespace pvr_recover.
+PVR_RECOVER ?= 0
 include serial_log.mk
 .PHONY: crash-screen-force
 $(OBJDIR)/crash-screen.h: crash-screen-force
 	@mkdir -p $(dir $@)
-	@printf '#define RE4DC_CRASH_SCREEN %s\n' '$(CRASH_SCREEN)' > $@.tmp
+	@printf '#define RE4DC_CRASH_SCREEN %s\n#define RE4DC_PVR_LATCH %s\n' '$(CRASH_SCREEN)' '$(PVR_LATCH)' > $@.tmp
 	@cmp -s $@.tmp $@ || mv $@.tmp $@
 	@rm -f $@.tmp
 $(OBJDIR)/platform/fault.o $(OBJDIR)/platform/crash_screen.o $(OBJDIR)/platform/os.o: $(OBJDIR)/crash-screen.h
@@ -513,7 +638,7 @@ $(OBJDIR)/route-movies.h: route-movies-force
 	@cmp -s $@.tmp $@ || mv $@.tmp $@
 	@rm -f $@.tmp
 ROUTE_MOVIE_PLATFORM = $(OBJDIR)/platform/native_movie.o $(OBJDIR)/platform/native_ui.o $(OBJDIR)/platform/pad.o
-ROUTE_MOVIE_GAME = $(OBJDIR)/src/game/game.o $(OBJDIR)/mod/st1_0/src/st1/r100.o $(OBJDIR)/mod/st1_1/src/st1/r101.o $(OBJDIR)/mod/st1_1/src/st1/r102.o $(OBJDIR)/mod/st1_1/src/st1/r104.o $(OBJDIR)/mod/st1_1/src/st1/r105.o $(OBJDIR)/mod/st1_1/src/st1/r106.o $(OBJDIR)/route_movie_bridge.o
+ROUTE_MOVIE_GAME = $(OBJDIR)/src/game/game.o $(OBJDIR)/mod/st1_0/src/st1/r100.o $(OBJDIR)/mod/st1_1/src/st1/r101.o $(OBJDIR)/mod/st1_1/src/st1/r102.o $(OBJDIR)/mod/st1_1/src/st1/r104.o $(OBJDIR)/mod/st1_1/src/st1/r105.o $(OBJDIR)/mod/st1_1/src/st1/r106.o $(OBJDIR)/mod/st1_1/src/st1/r10b.o $(OBJDIR)/route_movie_bridge.o $(ROUTE_MOVIE_GAME_CH21)
 $(ROUTE_MOVIE_PLATFORM) $(ROUTE_MOVIE_GAME): $(OBJDIR)/route-movies.h
 $(ROUTE_MOVIE_PLATFORM): PLATFORM_CPPFLAGS += -include $(OBJDIR)/route-movies.h
 $(ROUTE_MOVIE_GAME): GAME_CPPFLAGS += -include $(OBJDIR)/route-movies.h
@@ -623,9 +748,56 @@ include $(MODULES_MK)
 # of a GD-ROM (a GDI on GDEMU, tools/d367/mkgdi.sh). CD-R images are unaffected.
 GAME_LDFLAGS += -Wl,--wrap=cdrom_read_toc
 
+# LINK_TIGHT=1 (default 1 with ROUTE_CH21=1, else 0: no effect): link with a copy of KOS's shlelf.xc without its ten
+# empty icache-aligned .sub0...sub9 sections. Nothing in the image uses them, but their ALIGN(0x2000) still moves
+# .init and everything after it (rodata, data, bss, so _end and the KOS heap) to the next 8 KiB boundary: 0..8 KiB
+# of padding, and a jump of 8 KiB whenever .text crosses a boundary (the r119 lane's s30 heap_before cliff). With
+# the padding gone, image growth costs heap linearly.
+# LINK_OVL_HELPERS=1 (default 1 with ROUTE_CH21=1, else 0: no effect): image code that only one room overlay
+# (ROUTE_OVL: pl0f, em2f, em22, em2b) reaches moves into that overlay (tools/link.sh, tools/ovl_helpers.py: the
+# .text sections a link without that overlay drops); obj/ovlh/moves.tsv lists them. The sub screen overlay is
+# left alone.
+ifeq ($(ROUTE_CH21),1)
+LINK_TIGHT ?= 1
+LINK_OVL_HELPERS ?= 1
+else
+LINK_TIGHT ?= 0
+LINK_OVL_HELPERS ?= 0
+endif
+LINK_ENV = RE4DC_LINK_OVL_HELPERS=$(LINK_OVL_HELPERS)
+ifeq ($(ROUTE_CH21),1)
+# pl11 (Ashley, r117 on) reaches the DOL partner class cSubChar (32 KB of code the image otherwise drops): its code
+# moves with its vtable and the other read-only data only pl11 reaches (tools/ovl_helpers.py RE4DC_OVL_HELPERS_RO).
+LINK_ENV += RE4DC_OVL_HELPERS_RO=.ovl_pl11
+endif
+ifeq ($(LINK_TIGHT),1)
+LINK_KOS_SCRIPT = $(KOS_BASE)/utils/ldscripts/shlelf.xc
+ifeq ($(findstring -T$(LINK_KOS_SCRIPT),$(KOS_LDFLAGS)),)
+$(error LINK_TIGHT=1: KOS_LDFLAGS does not name -T$(LINK_KOS_SCRIPT))
+endif
+$(OBJDIR)/shlelf-tight.ld: $(LINK_KOS_SCRIPT) Makefile
+	@mkdir -p $(dir $@)
+	awk '/Custom sections, aligned to the icache size/{skip=1} !skip{print} skip && /sub9 is bigger than icache size/{skip=0}' $< > $@.tmp
+	@! grep -q 'sub[0-9]\|ICACHE_SIZE)' $@.tmp && grep -q '^  \.init' $@.tmp || { echo 'LINK_TIGHT: unexpected shlelf.xc layout' >&2; exit 1; }
+	mv $@.tmp $@
+$(TARGET): $(OBJDIR)/shlelf-tight.ld
+LINK_ENV += KOS_LDFLAGS='$(subst -T$(LINK_KOS_SCRIPT),-T$(abspath $(OBJDIR))/shlelf-tight.ld,$(KOS_LDFLAGS))'
+endif
+# MOVIE_FENCE_RETRY=1 (timing only; default 1 with ROUTE_CH21=1, else 0: no effect): a route movie retries a
+# not-ready render fence (up to 3 more times, logged) before a picture upload instead of failing the movie. One
+# LINK_TIGHT image layout ended r119 s30 at its first picture that way (terminal=3, uploaded=0).
+ifeq ($(ROUTE_CH21),1)
+MOVIE_FENCE_RETRY ?= 1
+else
+MOVIE_FENCE_RETRY ?= 0
+endif
+ifeq ($(MOVIE_FENCE_RETRY),1)
+$(OBJDIR)/platform/native_ui.o: PLATFORM_CPPFLAGS += -DRE4DC_MOVIE_FENCE_RETRY=1
+endif
+
 $(TARGET): $(KOS_BASE)/lib/$(KOS_ARCH)/libkallisti.a $(OBJS) $(GAME30_LINK_INPUTS) tools/link.sh tools/gen_aliases.py tools/gen_missing.py platform/aliases-manual.ld
 	@if [ "$(PVR_STREAM)" = 1 ]; then test "$$($(KOS_CC_BASE)/bin/$(KOS_CC_PREFIX)-nm -g --defined-only $(KOS_BASE)/lib/$(KOS_ARCH)/libkallisti.a | grep -Ec ' T _pvr_(set_manual_flip|resolve_frame)$$')" -eq 2 || { echo 'PVR_STREAM requires the pinned manual-flip KOS patch' >&2; exit 1; }; fi
-	GAME_LDFLAGS='$(GAME_LDFLAGS)' bash tools/link.sh $(TARGET) "$(GAME_OPT)" $(OBJS) $(GAME30_LINK_INPUTS)
+	$(LINK_ENV) GAME_LDFLAGS='$(GAME_LDFLAGS)' bash tools/link.sh $(TARGET) "$(GAME_OPT)" $(OBJS) $(GAME30_LINK_INPUTS)
 
 # Undefined-symbol inventory over every gameplay unit, REL modules included.
 census: $(CENSUS_OBJS) $(PLATFORM_OBJS) $(SDK_OBJS)
@@ -702,7 +874,7 @@ ENEMY_DEMAND ?= 0
 # Direct-slot consumers reviewed for this module set. Audit any newly linked
 # module before enabling sparse enemy backing; census/reference remain usable.
 ifeq ($(ENEMY_DEMAND),1)
-ifneq ($(filter-out st1_0 st1_1 st1_2 st1_3 wep02 em12 em23 em15 em26 em28 em21 em2a em29 em2e em13 em27 st2_0 st4_0 pl11 st2_2 em1f em18 em17 em24 wep01 wep07 wep09 wep11 wep13 wep19,$(MODULES)),)
+ifneq ($(filter-out st1_0 st1_1 st1_2 st1_3 wep02 em12 em23 em15 em26 em28 em21 em2a em29 em2e em13 em27 st2_0 st4_0 pl11 st2_2 em1f em18 em17 em24 pl0f em2f pl0f:ovl em2f:ovl em22:ovl em2b:ovl pl11:ovl em11 wep01 wep07 wep09 wep11 wep13 wep19,$(MODULES)),)
 $(error ENEMY_DEMAND requires a direct-slot consumer audit for the selected MODULES)
 endif
 endif
@@ -812,13 +984,20 @@ $(OBJDIR)/pipeline30.h: pipeline30-force
 	@printf '#define RE4DC_VRAM_PAGES %s\n#define RE4DC_VRAM_CENSUS %s\n' '$(VRAM_PAGES)' '$(VRAM_CENSUS)' >> $@.tmp
 	@printf '#define RE4DC_UI_HANDLES %s\n#define RE4DC_UI_HEADERS %s\n' '$(UI_HANDLES)' '$(UI_HEADERS)' >> $@.tmp
 	@printf '#define RE4DC_TEX_RESIDENT %s\n#define RE4DC_TEX_RESIDENT_RESERVE_KB %s\n#define RE4DC_TEX_PAYLOAD_CRC %s\n#define RE4DC_TEX_SLOTS %s\n' '$(TEX_RESIDENT)' '$(TEX_RESIDENT_RESERVE_KB)' '$(TEX_PAYLOAD_CRC)' '$(TEX_SLOTS)' >> $@.tmp
-	@printf '#define RE4DC_TEX_KEEP %s\n' '$(TEX_KEEP)' >> $@.tmp
+	@printf '#define RE4DC_TEX_KEEP %s\n#define RE4DC_PVR_LATCH %s\n' '$(TEX_KEEP)' '$(PVR_LATCH)' >> $@.tmp
 	@printf '#define RE4DC_MOVIE_WINDOW %s\n' '$(MOVIE_WINDOW)' >> $@.tmp
+	@printf '#define RE4DC_PVR_READY_STRICT %s\n#define RE4DC_PVR_RECOVER %s\n' '$(PVR_READY_STRICT)' '$(PVR_RECOVER)' >> $@.tmp
 	@if [ "$(MOVIE_WINDOW)" = 1 ] && { [ "$(VRAM_PAGES)" != 1 ] || [ "$(TEX_RESIDENT)" != 1 ]; }; then echo 'MOVIE_WINDOW=1 needs VRAM_PAGES=1 TEX_RESIDENT=1' >&2; exit 1; fi
 	@cmp -s $@.tmp $@ || mv $@.tmp $@
 	@rm -f $@.tmp
 $(OBJDIR)/platform/native_ui.o $(OBJDIR)/model_bridge.o: $(OBJDIR)/pipeline30.h
 $(OBJDIR)/platform/native_ui.o: PLATFORM_CPPFLAGS += -include $(OBJDIR)/pipeline30.h
+ifneq ($(filter 1 2,$(PVR_LATCH) $(PVR_READY_STRICT)),)
+$(OBJDIR)/platform/native_ui.o: PLATFORM_CPPFLAGS += -I$(KOS_BASE)/kernel/arch/dreamcast/hardware/pvr
+endif
+ifeq ($(PVR_READY_STRICT),1)
+GAME_LDFLAGS += -Wl,--wrap=pvr_list_begin -Wl,--wrap=pvr_set_presort_mode
+endif
 $(OBJDIR)/model_bridge.o: GAME_CPPFLAGS += -include $(OBJDIR)/pipeline30.h
 $(OBJDIR)/native-reuse/texture_package.o: $(OBJDIR)/pipeline30.h
 $(OBJDIR)/native-reuse/texture_package.o: PLATFORM_CPPFLAGS += -include $(OBJDIR)/pipeline30.h
@@ -1070,5 +1249,7 @@ include post30.mk
 include crowd.mk
 # D367 generic native models (NATIVE_MODEL_REGISTRY; default off: no effect).
 include native_model_registry.mk
+# D367 charbake (CHARBAKE_HAIR, CHARBAKE_TOGGLE; default off: no effect).
+include charbake.mk
 # Resolved knobs for tools/d367/build-r21.sh (re4dc-knobs; builds nothing).
 include knobs.mk

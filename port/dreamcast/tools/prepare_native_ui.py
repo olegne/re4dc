@@ -435,6 +435,9 @@ ROOM_CONTRACTS={
     'r108':dict(slots=27,smd=4,effs=(7,),itm=9,model_slots=()),
     'r109':dict(slots=30,smd=4,effs=(7,),itm=9,model_slots=()),
     'r10a':dict(slots=46,smd=4,effs=(7,42),itm=9,model_slots=(),header_grow=32),
+    # r10b (route, chapter 1-3's end, the lake): 36 slots, SMD#4, EFF#7 room effects, EFF#34 local effects,
+    # ITM#9, model TPL#27 (after BIN#26: the floating island); FCV#28-31, EMI#32, DSE#33, UWF#35 byte-identical.
+    'r10b':dict(slots=36,smd=4,effs=(7,34),itm=9,model_slots=(27,)),
     # r210 (St2, world coverage lane): 36 slots, SMD#4, EFF#7, ITM#9, model TPL#31 (after BIN#30); FCV#27-29/#32-35
     # (the lift motions) and every other slot stay byte-identical.
     'r210':dict(slots=36,smd=4,effs=(7,),itm=9,model_slots=(31,)),
@@ -453,8 +456,20 @@ ROOM_CONTRACTS={
     'r10c':dict(slots=35,smd=4,effs=(7,),itm=9,model_slots=(28,)),
     # r10f: 48 slots, models TPL#28 (BIN#27) and TPL#32 (BIN#31; BIN#30 alone); FCV#29/#33-46, EMI#47 byte-identical.
     'r10f':dict(slots=48,smd=4,effs=(7,),itm=9,model_slots=(28,32)),
+    # r11b (route lane r11b, chapter 2-1's start, the lake shore): 33 slots, SMD#4, EFF#7, ITM#9, model TPL#28
+    # (after BIN#27: the floating island, as r10b); FCV#29-32 (the island motions) byte-identical.
+    'r11b':dict(slots=33,smd=4,effs=(7,),itm=9,model_slots=(28,)),
     # r11a: r107's 27-slot layout.
     'r11a':dict(slots=27,smd=4,effs=(7,),itm=9,model_slots=()),
+    # r119 (route lane r119, El Gigante): 33 slots, SMD#4, EFF#7, ITM#9, model TPL#31 (after BIN#30: the room's tree,
+    # R119Init SetTree ROOM_ARC 0x22 / 0x23); SAT#27/#28 (the hut collision), SAT#29, EMI#26 and DSE#32 byte-identical.
+    'r119':dict(slots=33,smd=4,effs=(7,),itm=9,model_slots=(31,)),
+    # r118 (route lane r119): 29 slots, SMD#4, EFF#7 room effects, EFF#27 local effects, ITM#9; DSE#26, EMI#28.
+    'r118':dict(slots=29,smd=4,effs=(7,27),itm=9,model_slots=()),
+    # r117 (route lane r117, the church interior, chapter 2-1's end): 38 slots, SMD#4, EFF#7, ITM#9, model TPL#28
+    # (after BIN#27: the chandelier, R117Init SetObjSmd ROOM_ARC 0x1F / 0x20); FCV#29-36 (its swing) and EMI#37
+    # byte-identical. The header ends past the first payload (328 > 320), as r104's: header_grow=32.
+    'r117':dict(slots=38,smd=4,effs=(7,),itm=9,model_slots=(28,),header_grow=32),
     # r40b (St4, st4_0 + em1f; follow-up 7): r40c's 27-slot layout (header ends at 232 of 256: no growth).
     'r40b':dict(slots=27,smd=4,effs=(7,),itm=9,model_slots=()),
 }

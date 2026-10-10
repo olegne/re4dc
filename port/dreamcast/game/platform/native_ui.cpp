@@ -1,4 +1,7 @@
 #include <type_traits>
+#ifndef RE4DC_WORLD_AUTOSORT
+#define RE4DC_WORLD_AUTOSORT 0
+#endif
 #ifndef RE4DC_PS2_WORLD_DRAW
 #define RE4DC_PS2_WORLD_DRAW 0
 #endif
@@ -143,6 +146,16 @@
 #include <kos/genwait.h>
 #include <kos/sem.h>
 #endif
+#if RE4DC_PVR_LATCH || RE4DC_PVR_READY_STRICT
+#if RE4DC_PVR_PIPELINE != 2 || !RE4DC_PVR_STREAM
+#error PVR_LATCH and PVR_READY_STRICT read the KOS async-present state: need PVR_PIPELINE=2 and PVR_STREAM=1
+#endif
+#include <dc/asic.h>
+#include <dc/vblank.h>
+extern "C" {
+#include "pvr_internal.h"   // KOS pvr_state (Makefile: -I$(KOS_BASE)/kernel/arch/dreamcast/hardware/pvr)
+}
+#endif
 #include "native_ui.h"
 #include "hud_source_mask.h"
 #include "native_model.h"
@@ -161,6 +174,12 @@ extern "C" int re4dc_coarse_world_tex(unsigned i,unsigned out[5]);   // coarse_w
 
 #if RE4DC_COARSE_LEON
 extern "C" int re4dc_coarse_actor_texture_key(const Re4dcUiImage*,unsigned*,unsigned*);
+#endif
+#if RE4DC_PVR_RECOVER
+#if !RE4DC_PVR_READY_STRICT
+#error PVR_RECOVER runs in the PVR_READY_STRICT wait slices: need PVR_READY_STRICT=1
+#endif
+extern "C" int re4dc_fixture_read(const char* path,char* buffer,unsigned size);   // os.cpp (dc/crashtest.txt test aid)
 #endif
 namespace {
 constexpr unsigned kQuadCount=256, kTextureCount=RE4DC_TEX_RESIDENT?RE4DC_TEX_SLOTS:RE4DC_PVR_STREAM?80:48, kSourceCount=RE4DC_PVR_STREAM?128:256, kVramBudget=4*1024*1024;
@@ -609,6 +628,428 @@ bool guard_present(bool present,unsigned ta_faults){
     return present;
 }
 #endif
+#if RE4DC_PVR_LATCH
+// PVR_LATCH=1 (issue 9, hardware diagnosis; needs CRASH_SCREEN=1): a ring of the last PVR events with their UI
+// frame, event totals and the KOS PVR state, printed on the stop screen. The raw ASIC_ACK_A/B/C words read at the
+// failure cannot show an error event: KOS's ASIC dispatcher (asic.c handler_irq) acknowledges every pending bit
+// of all three registers on each ASIC interrupt, vblank included, whether or not the event is enabled. Here every
+// PVR event gets a chained handler (the previous handler, KOS's or the fast-wake chain, still runs first). Nothing
+// new is enabled: an event without its own interrupt (ISP render done, the five error events in a release KOS) is
+// still seen at the next dispatch, which reads all pending bits. Thread-side marks: scene open / close, fence,
+// TA bank wait over 95 ms (KOS ignores pvr_wait_ready's 100 ms timeout and writes the next scene anyway), bank
+// switches. Render-only: no frame, timing or logic decision reads any of it.
+namespace latch {
+constexpr unsigned kRing=64;
+volatile unsigned char ring_code[kRing];
+volatile unsigned short ring_frame[kRing];
+volatile unsigned head;
+// totals: S scene opened, c/d closed presented/discarded, o m t n p list done, R I render done TSP/ISP, F flip,
+// e error events (any), W TA bank waits over 95 ms, X fence failures
+enum {kS,kC,kO,kT,kP,kR,kI,kF,kE,kW,kX,kCounts};
+volatile unsigned counts[kCounts];
+volatile unsigned last_flips;
+#if RE4DC_PVR_LATCH>=2
+// PVR_LATCH=2 (latch v2, issue 9 after the d74b8ec8 photos): v1's ring lost every pre-hang event to 100 identical
+// Y slices and v1 watched only five of the six SB_ISTERR bits (KOS ASIC_EVT_PVR_PARAM_OUTOFMEM, bit 2, was missing,
+// and its "er" legend called bit 3 "OPB out of memory" bit 2). v2: a run of one code is one ring entry with a
+// count; "er" is the SB_ISTERR bit set itself (bit 0 render ISP out of cache, 1 render strip buffer hazard, 2 TA
+// ISP/TSP parameter overflow, 3 TA object list pointer overflow, 4 TA illegal parameter, 5 TA FIFO overflow), each
+// with the UI frame it first appeared and its count; every scene's TA vertex / OPB use at its close (the positions
+// the render of that scene reads) is kept for the last two scenes and as a maximum since boot.
+volatile unsigned short ring_rep[kRing];
+volatile unsigned errors;          // SB_ISTERR bits seen since boot (bit n = ASIC event 0x0200+n)
+volatile unsigned err_first[6],err_count[6];
+struct SceneUse { unsigned frame,vtx,opb; };
+volatile SceneUse scene_use[2];    // [0] newest closed scene
+volatile unsigned max_vtx,max_vtx_frame,max_opb,max_opb_frame;
+constexpr unsigned kNEvents=13;
+asic_evt_handler_entry_t prev[kNEvents];
+constexpr std::uint16_t kEvents[kNEvents]={ASIC_EVT_PVR_OPAQUEDONE,ASIC_EVT_PVR_OPAQUEMODDONE,ASIC_EVT_PVR_TRANSDONE,
+    ASIC_EVT_PVR_TRANSMODDONE,ASIC_EVT_PVR_PTDONE,ASIC_EVT_PVR_RENDERDONE_TSP,ASIC_EVT_PVR_RENDERDONE_ISP,
+    ASIC_EVT_PVR_ISP_OUTOFMEM,ASIC_EVT_PVR_STRIP_HALT,ASIC_EVT_PVR_PARAM_OUTOFMEM,ASIC_EVT_PVR_OPB_OUTOFMEM,
+    ASIC_EVT_PVR_TA_INPUT_ERR,ASIC_EVT_PVR_TA_INPUT_OVERFLOW};
+constexpr char kCodes[kNEvents]={'o','m','t','n','p','R','I','0','1','2','3','4','5'};
+constexpr unsigned char kCount[kNEvents]={kO,kO,kT,kT,kP,kR,kI,kE,kE,kE,kE,kE,kE};
+#else
+volatile unsigned errors;          // error event bits: 1 ISP out of memory, 2 strip halt, 4 OPB out of memory, 8 TA input error, 16 TA input overflow
+constexpr unsigned kNEvents=12;
+asic_evt_handler_entry_t prev[12];
+constexpr std::uint16_t kEvents[12]={ASIC_EVT_PVR_OPAQUEDONE,ASIC_EVT_PVR_OPAQUEMODDONE,ASIC_EVT_PVR_TRANSDONE,
+    ASIC_EVT_PVR_TRANSMODDONE,ASIC_EVT_PVR_PTDONE,ASIC_EVT_PVR_RENDERDONE_TSP,ASIC_EVT_PVR_RENDERDONE_ISP,
+    ASIC_EVT_PVR_ISP_OUTOFMEM,ASIC_EVT_PVR_STRIP_HALT,ASIC_EVT_PVR_OPB_OUTOFMEM,ASIC_EVT_PVR_TA_INPUT_ERR,
+    ASIC_EVT_PVR_TA_INPUT_OVERFLOW};
+constexpr char kCodes[12]={'o','m','t','n','p','R','I','1','2','3','4','5'};
+constexpr unsigned char kCount[12]={kO,kO,kT,kT,kP,kR,kI,kE,kE,kE,kE,kE};
+#endif
+void put(char c){
+    const int o=irq_disable();
+    const unsigned h=head;
+#if RE4DC_PVR_LATCH>=2
+    if(h && ring_code[(h-1)%kRing]==static_cast<unsigned char>(c)){
+        if(ring_rep[(h-1)%kRing]<65535)ring_rep[(h-1)%kRing]=static_cast<unsigned short>(ring_rep[(h-1)%kRing]+1);
+        irq_restore(o);return;
+    }
+    ring_rep[h%kRing]=1;
+#endif
+    ring_code[h%kRing]=static_cast<unsigned char>(c);ring_frame[h%kRing]=static_cast<unsigned short>(frame);head=h+1;
+    irq_restore(o);
+}
+void bump(unsigned k){const int o=irq_disable();counts[k]=counts[k]+1;irq_restore(o);}
+void event(uint32_t code,void* data){
+    const unsigned i=unsigned(reinterpret_cast<std::uintptr_t>(data));
+    if(i>=kNEvents)return;
+    if(prev[i].hdl)prev[i].hdl(code,prev[i].data);
+    put(kCodes[i]);counts[kCount[i]]=counts[kCount[i]]+1;
+#if RE4DC_PVR_LATCH>=2
+    if(i>=7){
+        const unsigned b=code&0xff;
+        if(b<6){
+            if(!(errors&(1U<<b)))err_first[b]=frame;
+            err_count[b]=err_count[b]+1;errors=errors|(1U<<b);
+        }
+    }
+#else
+    if(i>=7)errors=errors|(1U<<(i-7));
+#endif
+}
+#if RE4DC_PVR_LATCH>=2
+// stream_close, before the scene's lists finish: the TA registers still describe this scene's bank.
+void scene_close(){
+    const unsigned vs=PVR_GET(PVR_TA_VERTBUF_START),vp=PVR_GET(PVR_TA_VERTBUF_POS);
+    const unsigned oi=PVR_GET(PVR_TA_OPB_INIT),op=PVR_GET(PVR_TA_OPB_POS)*4U;   // OPB_POS: word units on hardware
+    const unsigned v=vp>=vs?vp-vs:0,b=op>=oi?op-oi:0;
+    const int o=irq_disable();
+    scene_use[1].frame=scene_use[0].frame;scene_use[1].vtx=scene_use[0].vtx;scene_use[1].opb=scene_use[0].opb;
+    scene_use[0].frame=frame;scene_use[0].vtx=v;scene_use[0].opb=b;
+    if(v>max_vtx){max_vtx=v;max_vtx_frame=frame;}
+    if(b>max_opb){max_opb=b;max_opb_frame=frame;}
+    irq_restore(o);
+}
+#endif
+void vblank(uint32_t,void*){
+    const unsigned f=unsigned(pvr_state.frame_count);
+    if(f!=last_flips){last_flips=f;put('F');counts[kF]=counts[kF]+1;}
+}
+void install(){
+    last_flips=unsigned(pvr_state.frame_count);
+    for(unsigned i=0;i<kNEvents;++i)prev[i]=asic_evt_set_handler(kEvents[i],event,reinterpret_cast<void*>(std::uintptr_t(i)));
+    const int handle=vblank_handler_add(vblank,nullptr);
+    re4dc_log("native PVR latch: %u events chained (kos handlers %d/%d/%d) vblank=%d\n",kNEvents,prev[0].hdl!=nullptr,
+              prev[5].hdl!=nullptr,prev[9].hdl!=nullptr,handle);
+}
+// Thread side: the scene's first list (KOS pvr_start_ta_rendering waits up to 100 ms for the TA bank, then
+// proceeds even on a timeout).
+void list_begin_timed(pvr_list_t list,bool& failed){
+    const bool busy=pvr_check_ready()<0;
+    const auto t=busy?timer_us_gettime64():0;
+    failed=pvr_list_begin(list)<0;
+    if(busy && timer_us_gettime64()-t>95000){put('W');bump(kW);}
+}
+}
+#endif
+#if RE4DC_PVR_READY_STRICT
+// PVR_READY_STRICT=1 (issue 9): never write a scene into a TA bank, a tile matrix or a VRAM page the PVR may still
+// read after a timed-out wait. KOS (pinned toolchain, kernel/arch/dreamcast/hardware/pvr) waits 100 ms and then
+// carries on regardless in three places this build reaches:
+// - pvr_scene.c pvr_start_ta_rendering() (static, inlined into pvr_list_begin at a scene's first list):
+//   pvr_wait_ready()'s timeout is ignored, so the next scene's TA input goes into the bank whose previous scene was
+//   never handed to a render (no TA list init: it is appended to it). When that render finally starts,
+//   pvr_begin_queued_render() puts the background plane at the TA's current vertex position, in the middle of the
+//   new scene, and pvr_sync_reg_buffer() re-inits the TA under a half-written scene: a corrupted render (an ISP
+//   lockup on real hardware) or a scene whose list-done events never all arrive (never rendered).
+//   With one bank (TA_DOUBLEBUF off, the sub-screen backing) pvr_wait_render_done()'s timeout is ignored there too:
+//   TA input into the bank the render reads.
+// - pvr_buffers.c pvr_set_presort_mode() (WORLD_AUTOSORT, stream_open / world_sort_begin): writes the TA target
+//   bank's tile matrix; with one bank after an ignored pvr_wait_render_done() timeout, the matrix being rendered.
+// - pvr_irq.c pvr_present_wait() (present_fence: every scene open in single-bank mode and every VRAM upload / free)
+//   returns -1 after ONE 100 ms wait; the build halts there ("completion fence failed"), so a render that is only
+//   slow (a GPU-bound frame queued behind the previous one) stops the game.
+// Here (link wraps, the toolchain stays as pinned) each wait goes on in 100 ms slices up to kSlices (10 s, inside
+// the 30 s hang watchdog); every expired slice is counted and, with PVR_LATCH, put in the event ring with its UI
+// frame: K TA bank (previous scene not yet handed to a render), Q render done (one bank / tile matrix),
+// Y present fence. Past the bound the failure is reported as before (the stop screen names it). No TA or ISP reset
+// (rejected: it would hide the failure). Render-only: no frame, timing or logic decision reads any of it; in
+// Flycast no wait ever expires (renders complete at once), so the image behaves exactly as without the knob.
+// Checked and left alone (they do not proceed into a busy bank): pvr_render_lists() (starts a render only with
+// render_busy and render_completed clear, all lists in), pvr_apply_decision()/pvr_present_async() (a decision
+// applies only after render-done), the fast-wake and latch chains (KOS's handler runs first), pvr_scene_finish()
+// (its blank lists follow a list_begin of the same scene), pvr_set_vbuf_doublebuf() (refuses while busy),
+// re4dc_ui_ta_single_bank() and stream_open()'s single-bank path (present_fence first, which halts on failure), the
+// gpu::quiesce() callers (after present_fence; a timeout halts or skips the VRAM change).
+#if RE4DC_PVR_RECOVER
+// PVR_RECOVER=1 (issue 9, default 0; needs PVR_READY_STRICT=1): a render the console never finishes (d74b8ec8 photos:
+// the last closed scene got all three list-done events, its render started and render-done never came; SB_ISTERR
+// bit 0 "ISP out of cache" and bit 3 "object list pointer overflow" were raised) stopped the game for good. Here a
+// render still busy after a bounded time is reset the way the hardware allows and its frame is dropped:
+// - Detection, in PVR_READY_STRICT's 100 ms wait slices (K TA bank, Q render done, Y present fence): the render
+//   has been busy for kStuckMs (1 s), or kStuckErrMs (100 ms) once a render error (SB_ISTERR bit 0 or 1) was
+//   raised during it. P2, the TA side: a closed scene whose list-done events have not all arrived after kStuckMs
+//   while no render runs.
+// - Action, in the next vblank interrupt (the thread only asks; the ISR context is what KOS's handlers expect):
+//   P1: PVR soft reset of the ISP/TSP core (SOFTRESET 0x005F8008 bit 1, then 0), then the render-done handler chain
+//   below this one (KOS pvr_int_handler: render_busy 0, render_completed 1, the pending present/discard decision
+//   applied, waiters woken; the fast-wake chain) runs as if the interrupt had come. The dropped frame's buffer is
+//   flipped as it is (partly drawn); the next scene renders normally. P2: a TA soft reset (bit 0) only when a TA
+//   error (SB_ISTERR bit 4 or 5) was raised, then the missing list-done events through their handler chains, so
+//   KOS starts the render (pvr_render_lists re-inits the TA registers for the other bank).
+// - Last resort: kGiveUp recoveries in a row without one render finishing on its own stop the game with the stop
+//   screen ("PVR render recovery gave up").
+// Render-only: nothing runs until a wait has expired, which never happens in Flycast (renders finish at once) and
+// so never in a gate run; every recovery logs "pvr recover:" and counts in the stop screen's rdy row.
+// Test aid (never on a play disc): dc/crashtest.txt "pvrhang <ui frame> <n>" swallows n render-done interrupts
+// from that frame on (render_busy stays set as on the console), "pvrlist <ui frame>" one translucent list-done.
+namespace pvr_recover {
+constexpr unsigned kStuckMs=1000,kStuckErrMs=100,kGiveUp=8;
+asic_evt_handler_entry_t done_prev{},list_prev[3]{};
+constexpr std::uint16_t kListEvents[3]={ASIC_EVT_PVR_OPAQUEDONE,ASIC_EVT_PVR_TRANSDONE,ASIC_EVT_PVR_PTDONE};
+constexpr unsigned kListBits[3]={1U<<PVR_LIST_OP_POLY,1U<<PVR_LIST_TR_POLY,1U<<PVR_LIST_PT_POLY};
+asic_evt_handler_entry_t err_prev[6]{};
+volatile unsigned req;            // 1 P1 render, 2 P2 TA lists; cleared by the vblank handler
+volatile unsigned err_bits;       // SB_ISTERR bits since the current render started
+volatile bool busy_seen;
+volatile std::uint64_t busy_since;
+volatile unsigned p1,p2,in_row,last_frame,natural;
+volatile bool synth;
+volatile int inject_hang_frame=-1,inject_hang_left,inject_list_frame=-1;
+void note_render_state(){   // IRQ context
+    if(pvr_state.render_busy){
+        if(!busy_seen){busy_seen=true;busy_since=timer_us_gettime64();err_bits=0;}
+    } else busy_seen=false;
+}
+void done_chain(uint32_t code,void* data){
+    (void)data;
+    if(!synth && inject_hang_frame>=0 && int(frame)>=inject_hang_frame && inject_hang_left>0){
+        inject_hang_left=inject_hang_left-1;   // test: the render-done interrupt never arrives
+        return;
+    }
+    if(done_prev.hdl)done_prev.hdl(code,done_prev.data);
+    if(!synth){in_row=0;natural=natural+1;}
+    note_render_state();
+}
+void list_chain(uint32_t code,void* data){
+    const unsigned i=unsigned(reinterpret_cast<std::uintptr_t>(data));
+    if(i>=3)return;
+    if(!synth && i==1 && inject_list_frame>=0 && int(frame)>=inject_list_frame){inject_list_frame=-1;return;}
+    if(list_prev[i].hdl)list_prev[i].hdl(code,list_prev[i].data);
+    note_render_state();
+}
+void err_chain(uint32_t code,void* data){
+    const unsigned b=unsigned(reinterpret_cast<std::uintptr_t>(data));
+    if(b<6 && err_prev[b].hdl)err_prev[b].hdl(code,err_prev[b].data);
+    if(b<6)err_bits=err_bits|(1U<<b);
+}
+void vblank(uint32_t,void*){
+    note_render_state();
+    const unsigned r=req;
+    if(!r)return;
+    synth=true;
+    if(r==1 && pvr_state.render_busy){
+        PVR_SET(PVR_RESET,PVR_RESET_ISPTSP);PVR_SET(PVR_RESET,PVR_RESET_NONE);
+        if(done_prev.hdl)done_prev.hdl(ASIC_EVT_PVR_RENDERDONE_TSP,done_prev.data);
+    } else if(r==2 && !pvr_state.render_busy && pvr_state.ta_busy){
+        if(err_bits&0x30){PVR_SET(PVR_RESET,PVR_RESET_TA);PVR_SET(PVR_RESET,PVR_RESET_NONE);}
+        for(unsigned i=0;i<3;++i)
+            if((pvr_state.lists_enabled&kListBits[i]) && !(pvr_state.lists_transferred&kListBits[i]) && list_prev[i].hdl)
+                list_prev[i].hdl(kListEvents[i],list_prev[i].data);
+    }
+    synth=false;
+    note_render_state();
+    req=0;
+    genwait_wake_all((void*)&req);
+}
+void install(){
+    char t[48]={0};
+    if(re4dc_fixture_read("/cd/dc/crashtest.txt",t,sizeof(t)-1)>0){
+        unsigned a=0,b=0;
+        if(!std::strncmp(t,"pvrhang",7) && std::sscanf(t+7,"%u %u",&a,&b)==2){inject_hang_frame=int(a);inject_hang_left=int(b);}
+        else if(!std::strncmp(t,"pvrlist",7) && std::sscanf(t+7,"%u",&a)==1)inject_list_frame=int(a);
+    }
+    done_prev=asic_evt_set_handler(ASIC_EVT_PVR_RENDERDONE_TSP,done_chain,nullptr);
+    for(unsigned i=0;i<3;++i)list_prev[i]=asic_evt_set_handler(kListEvents[i],list_chain,reinterpret_cast<void*>(std::uintptr_t(i)));
+    for(unsigned b=0;b<6;++b)err_prev[b]=asic_evt_set_handler(std::uint16_t(ASIC_EVT_PVR_ISP_OUTOFMEM+b),err_chain,reinterpret_cast<void*>(std::uintptr_t(b)));
+    const int handle=vblank_handler_add(vblank,nullptr);
+    re4dc_log("pvr recover: armed (stuck %u ms, %u ms after a render error, give up after %u) vblank=%d test hang=%d/%d list=%d\n",
+              kStuckMs,kStuckErrMs,kGiveUp,handle,int(inject_hang_frame),int(inject_hang_left),int(inject_list_frame));
+}
+// Called by the wait loops once per expired 100 ms slice (IRQs disabled). code: K / Q / Y.
+volatile bool gave_up;
+bool on_slice(char code){
+    if(gave_up)return true;
+    unsigned kind=0;
+    const std::uint64_t now=timer_us_gettime64();
+    if(pvr_state.render_busy && busy_seen){
+        const std::uint64_t ms=(now-busy_since)/1000;
+        if(ms>=((err_bits&3)?kStuckErrMs:kStuckMs))kind=1;
+    } else if(code=='K' && !pvr_state.render_busy && pvr_state.ta_busy &&
+              pvr_state.lists_transferred!=pvr_state.lists_enabled){
+        // The previous scene is closed (this wait is the next scene's first list) and its lists never all arrived.
+        static unsigned k_slices;static unsigned k_frame=~0U;
+        if(k_frame!=frame){k_frame=frame;k_slices=0;}
+        if(++k_slices>=kStuckMs/100)kind=2;
+    }
+    if(!kind)return false;
+    if(in_row>=kGiveUp){gave_up=true;return true;}
+    in_row=in_row+1;last_frame=frame;
+    if(kind==1)p1=p1+1;else p2=p2+1;
+#if RE4DC_PVR_LATCH
+    latch::put(kind==1?'V':'U');
+#endif
+    re4dc_log("pvr recover: P%u at ui frame %u (wait %c, render busy %ums, isterr %02x, lists %02x/%02x, in a row %u)\n",kind,frame,
+              code,busy_seen?unsigned((now-busy_since)/1000):0U,err_bits,unsigned(pvr_state.lists_transferred),
+              unsigned(pvr_state.lists_enabled),in_row);
+    req=kind;
+    for(unsigned tries=0;req && tries<4;++tries)genwait_wait((void*)&req,"re4dc recover",50);
+    return false;
+}
+}
+#endif
+namespace pvr_ready {
+constexpr unsigned kSliceMs=100,kSlices=100;
+volatile int test_slices;   // crash_screen.cpp "pvrwait" test (re4dc_pvr_ready_test_arm): slices to expire
+volatile unsigned ta_timeouts,render_timeouts,present_timeouts,first_frame=~0U,last_frame;
+void note(char code,volatile unsigned& n){
+    n=n+1;if(first_frame==~0U)first_frame=frame;last_frame=frame;
+#if RE4DC_PVR_LATCH
+    latch::put(code);
+#else
+    (void)code;
+#endif
+}
+// Wait until a KOS PVR flag clears (KOS wakes the flag's genwait queue: ta_busy at render start, render_busy at
+// render done). Returns false only past the bound.
+bool wait_clear(volatile int& flag,const char* what,char code,volatile unsigned& n){
+    const int o=irq_disable();
+    unsigned slices=0;
+    while(flag && slices<kSlices)
+        if(genwait_wait((void*)&flag,what,kSliceMs)<0 && flag){
+            note(code,n);++slices;
+#if RE4DC_PVR_RECOVER
+            if(pvr_recover::on_slice(code))break;
+#endif
+        }
+    const bool ok=!flag;
+    irq_restore(o);
+#if RE4DC_PVR_RECOVER
+    if(pvr_recover::gave_up)re4dc_missing("PVR render recovery gave up");
+#endif
+    return ok;
+}
+// Before KOS's own 100 ms waits run (they then return at once).
+void acquire_bank(){
+    if(pvr_state.ta_checked_ready)return;   // this scene already owns its TA bank
+    // Crash test (dc/crashtest.txt "pvrwait", never on a play disc): one expired 100 ms slice per scene, counted as
+    // a TA bank timeout, so the stop screen's rdy row can be checked in Flycast (renders never stall there).
+    if(test_slices>0){
+        test_slices=test_slices-1;
+        const int o=irq_disable();genwait_wait((void*)&test_slices,"re4dc ready test",kSliceMs);irq_restore(o);
+        note('K',ta_timeouts);
+    }
+    if(!wait_clear(pvr_state.ta_busy,"re4dc TA bank",'K',ta_timeouts))re4dc_missing("PVR TA bank wait timed out (strict)");
+    if(!pvr_state.vbuf_doublebuf && !wait_clear(pvr_state.render_busy,"re4dc render done",'Q',render_timeouts))
+        re4dc_missing("PVR render wait timed out (strict)");
+}
+int present_wait(){
+    for(unsigned slices=0;;){
+        if(pvr_present_wait()==0 || !pvr_present_pending())return 0;
+        note('Y',present_timeouts);
+#if RE4DC_PVR_RECOVER
+        {const int o=irq_disable();const bool give_up=pvr_recover::on_slice('Y');irq_restore(o);
+         if(give_up)re4dc_missing("PVR render recovery gave up");}
+#endif
+        if(++slices>=kSlices)return -1;
+    }
+}
+}
+extern "C" void re4dc_pvr_ready_test_arm(int slices){pvr_ready::test_slices=slices;}
+extern "C" int __real_pvr_list_begin(pvr_list_t list);
+extern "C" int __wrap_pvr_list_begin(pvr_list_t list){
+    // DMA lists (unused here) do not touch the TA at list_begin, as in KOS.
+    if(!(pvr_state.dma_mode && pvr_state.dma_buffers[pvr_state.ram_target].base[list]))pvr_ready::acquire_bank();
+    return __real_pvr_list_begin(list);
+}
+extern "C" void __real_pvr_set_presort_mode(bool presort);
+extern "C" void __wrap_pvr_set_presort_mode(bool presort){
+    pvr_ready::acquire_bank();   // the target bank's tile matrix is free only once the bank is acquired
+    __real_pvr_set_presort_mode(presort);
+}
+#endif
+#if RE4DC_PVR_LATCH
+// The stop screen's lines (crash_screen.cpp, which = 0..3), formatted at the failure; 0 past the last line.
+extern "C" int re4dc_pvr_latch_line(unsigned which,char* out,unsigned size){
+    using namespace latch;
+    if(which==0){
+        snprintf(out,size,"st ta%d rb%d rc%d le%02x lt%02x tt%d vt%d db%d pd%d er%02x",int(pvr_state.ta_busy),
+            int(pvr_state.render_busy),int(pvr_state.render_completed),unsigned(pvr_state.lists_enabled),
+            unsigned(pvr_state.lists_transferred),int(pvr_state.ta_target),int(pvr_state.view_target),
+            int(pvr_state.vbuf_doublebuf),pvr_present_pending(),errors);
+        return 1;
+    }
+    if(which==1){
+        snprintf(out,size,"n S%u c%u o%u t%u p%u R%u I%u F%u W%u X%u",counts[kS]%1000,counts[kC]%1000,
+            counts[kO]%1000,counts[kT]%1000,counts[kP]%1000,counts[kR]%1000,counts[kI]%1000,counts[kF]%1000,
+            counts[kW]%1000,counts[kX]%1000);
+        return 1;
+    }
+    if(which==2){
+        // Newest events last; a frame's events follow its last two digits and ':'.
+        const unsigned h=head,n=h<kRing?h:kRing;
+#if RE4DC_PVR_LATCH>=2
+        char tmp[kRing*10+8];unsigned len=0,last=~0U;   // v2: a run of one code reads "Y*100"
+#else
+        char tmp[kRing*4+8];unsigned len=0,last=~0U;
+#endif
+        for(unsigned k=h-n;k!=h;++k){
+            const unsigned f=ring_frame[k%kRing];
+            if(f!=last){tmp[len++]=' ';tmp[len++]=char('0'+f/10%10);tmp[len++]=char('0'+f%10);tmp[len++]=':';last=f;}
+            tmp[len++]=char(ring_code[k%kRing]);
+#if RE4DC_PVR_LATCH>=2
+            if(ring_rep[k%kRing]>1)len+=unsigned(snprintf(tmp+len,8,"*%u",unsigned(ring_rep[k%kRing])));
+#endif
+        }
+        tmp[len]=0;
+        // Keep the newest end that fits.
+        const unsigned room=size>4?size-4:0;
+        snprintf(out,size,"ev%s",len>room?tmp+(len-room):tmp);
+        return 1;
+    }
+#if RE4DC_PVR_READY_STRICT
+    if(which==3){
+        // PVR_READY_STRICT: expired 100 ms slices (K TA bank, Q render done, Y present fence) and the UI frames of
+        // the first and the last one; "rdy K0 Q0 Y0" = the path never fired.
+#if RE4DC_PVR_RECOVER
+        // PVR_RECOVER: "rv <P1>/<P2> <last frame>" recoveries (render reset / TA lists) and the UI frame of the last.
+        char rv[24]="";
+        if(pvr_recover::p1 || pvr_recover::p2)snprintf(rv,sizeof(rv)," rv%u/%u@%u",pvr_recover::p1,pvr_recover::p2,pvr_recover::last_frame);
+#else
+        const char* rv="";
+#endif
+        if(pvr_ready::first_frame==~0U)snprintf(out,size,"rdy K0 Q0 Y0%s",rv);
+        else snprintf(out,size,"rdy K%u Q%u Y%u first %u last %u%s",pvr_ready::ta_timeouts,pvr_ready::render_timeouts,
+                      pvr_ready::present_timeouts,pvr_ready::first_frame,pvr_ready::last_frame,rv);
+        return 1;
+    }
+#endif
+#if RE4DC_PVR_LATCH>=2
+    if(which==4){
+        // SB_ISTERR bits seen since boot: e<bit>@<first UI frame>x<count>; then the largest scene since boot
+        // (TA vertex bytes, OPB overflow-pool bytes) with its UI frame.
+        int n=snprintf(out,size,"er");
+        for(unsigned b=0;b<6 && n<int(size);++b)
+            if(errors&(1U<<b))n+=snprintf(out+n,size-n," e%u@%ux%u",b,err_first[b],err_count[b]);
+        if(n<int(size))snprintf(out+n,size-n," mx v%x o%x",max_vtx,max_opb);
+        return 1;
+    }
+    if(which==5){
+        // The last two closed scenes (newest first): UI frame, TA vertex bytes, OPB overflow-pool bytes at their
+        // close; the render that hangs reads one of these.
+        snprintf(out,size,"sc %u v%x o%x | %u v%x o%x",scene_use[0].frame,scene_use[0].vtx,scene_use[0].opb,
+                 scene_use[1].frame,scene_use[1].vtx,scene_use[1].opb);
+        return 1;
+    }
+#endif
+    return 0;
+}
+#endif
 #if RE4DC_PVR_PIPELINE
 // Frame N's render and flip overlap frame N+1's CPU work. The late present/
 // discard decision is unchanged (Render_swap still makes it); a presenter
@@ -640,12 +1081,22 @@ void start_presenter(){
 }
 void present_fence(){
     if(!pvr_present_pending())return;
+#if RE4DC_PVR_LATCH
+    latch::put('f');
+#endif
     const auto start=timer_us_gettime64();
     // The timed waiter can become runnable before the render/vblank IRQ
     // completes, then resume with its old error after presentation finished.
     // Recheck ownership before treating that timeout as an unfinished frame.
+#if RE4DC_PVR_READY_STRICT
+    if(pvr_ready::present_wait()<0 && pvr_present_pending()){   // keeps waiting past 100 ms (bounded)
+#else
     if(pvr_present_wait()<0 && pvr_present_pending()){
+#endif
         ++fence_timeouts;present_failures=present_failures|1;
+#if RE4DC_PVR_LATCH
+        latch::put('X');latch::bump(latch::kX);
+#endif
     }
     ++fence_blocked;fence_wait_us+=timer_us_gettime64()-start;
     present_resolved=present_submitted;
@@ -724,10 +1175,21 @@ void present_submit(bool present,unsigned ta_faults){
 #endif
 #endif
 
+#if !RE4DC_WORLD_AUTOSORT
+constexpr float overlay_depth(){return 1.0f;}
+#endif
+
 #if RE4DC_PVR_STREAM
 // One serial PVR owner, no extra framebuffer or whole-scene packet copy.
 // KOS's opt-in manual flip preserves the source's late presentation decision.
 bool stream_scene,stream_aborted,stream_retire;
+#if RE4DC_WORLD_AUTOSORT
+bool world_autosort;
+unsigned overlay_layer;
+// Ordinary world 1/w is below one. Screen-space strips use increasing constant
+// depths so hardware sorting retains their emission order without changing UVs.
+float overlay_depth(){return world_autosort?float(2U+overlay_layer++):1.0f;}
+#endif
 unsigned stream_model_bytes,stream_peak_bytes,stream_discards,stream_black_frames;
 #if RE4DC_TA_DIRECT
 bool direct_open;               // re4dc_model_direct_begin/end: SQ held
@@ -753,6 +1215,158 @@ void ta_hash_reset(){for(unsigned i=0;i<5;++i){ta_hash_h[i]=2166136261u;ta_hash_
 void ta_hash_reset(){for(unsigned i=0;i<5;++i){ta_hash_h[i]=2166136261u;ta_hash_words[i]=0;}}
 #endif
 void ta_hash_marker(pvr_list_t list){const std::uint32_t w=0xF00D0000u|(unsigned)list;re4dc_ta_hash(&w,4);}
+#if RE4DC_TA_BIN_DIAG
+// TA_BIN_DIAG=1 (issue 9, test builds only; needs TA_HASH): replays every 32-byte TA burst the TA_HASH hooks see
+// through a model of the hardware tiler (20x15 tiles of 32x32): one object pointer per strip object of up to six
+// triangles (bounding box per triangle) or per sprite, in every tile it touches; object pointer blocks of the
+// list's size (OP/TR TA_OPB_BINS words, PT 8 with TREE_IMPOSTOR), the last word of a block reserved for the link,
+// one word for the end-of-list. Logs per scene the overflow-pool bytes it needs against the pool KOS reserves
+// (opb_overflow_count x the initial blocks), the deepest tile per list, the translucent triangles in the
+// busiest tile (the ISP autosort load) and an ISP/TSP parameter estimate against the TA vertex bank.
+namespace tabin {
+constexpr unsigned kTw=20,kTh=15,kTiles=kTw*kTh;
+unsigned short ent[5][kTiles];
+unsigned short trtri[kTiles];
+unsigned stamp[kTiles],objid;
+struct L{ unsigned hdr_words,vtx_words,param_words; bool sprite,vtx64,half,hdr64_pending,tex,uv16,offset,vol; unsigned nv,tri_in_obj;
+          float x[2],y[2]; unsigned objs,tris,verts,short_strips,orphans; };
+L ls[5];
+unsigned scene_param,scene_wild,scene_mismatch,scene_lists_seen;
+unsigned max_pool,max_param,max_trtile,scenes;
+// The previous scene's busiest translucent tile: which callers of re4dc_ta_hash (return address) put triangles
+// there, and the header words (TSP, TCW) of the biggest contributor.
+void* cur_ra;
+unsigned hot_tile=~0U,hot_op_tile=~0U;
+struct Contrib{ void* ra; unsigned tris,tsp,tcw; };
+Contrib hot[8],hot_op[8];
+unsigned cur_tsp[5],cur_tcw[5];
+void contrib(Contrib* c,unsigned add,unsigned list){
+    for(unsigned i=0;i<8;++i){
+        if(c[i].ra==cur_ra){c[i].tris+=add;return;}
+        if(!c[i].ra){c[i].ra=cur_ra;c[i].tris=add;c[i].tsp=cur_tsp[list];c[i].tcw=cur_tcw[list];return;}
+    }
+}
+unsigned blocks_words(unsigned list){
+#if RE4DC_TREE_IMPOSTOR
+    if(list==4)return 8;
+#endif
+    return list==0||list==2?unsigned(RE4DC_TA_OPB_BINS):(list==4?16U:0U);
+}
+inline int clampt(float v,int hi){ if(!(v==v))return -1; if(v<0)return 0; const int t=int(v)>>5; return t>hi?hi:t; }
+void add_box(unsigned list,float x0,float x1,float y0,float y1,unsigned tris){
+    if(!(x0==x0&&x1==x1&&y0==y0&&y1==y1)){++scene_wild;return;}
+    if(x0<-8192||x1>8192||y0<-8192||y1>8192)++scene_wild;
+    if(x1<0||y1<0||x0>=640||y0>=480)return;   // outside the global tile clip
+    const int tx0=clampt(x0,kTw-1),tx1=clampt(x1,kTw-1),ty0=clampt(y0,kTh-1),ty1=clampt(y1,kTh-1);
+    for(int ty=ty0;ty<=ty1;++ty)for(int tx=tx0;tx<=tx1;++tx){
+        const unsigned t=unsigned(ty)*kTw+unsigned(tx);
+        if(stamp[t]!=objid){stamp[t]=objid;if(ent[list][t]<65535)++ent[list][t];if(list==0 && t==hot_op_tile)contrib(hot_op,1,0);}
+        if(list==2){trtri[t]=static_cast<unsigned short>(std::min(65535U,unsigned(trtri[t])+tris));if(t==hot_tile)contrib(hot,tris,2);}
+    }
+}
+void obj_begin(L& s){ ++objid; ++s.objs; s.tri_in_obj=0; scene_param+=s.hdr_words; }
+void feed_block(unsigned list,const std::uint32_t* q){
+    L& s=ls[list];
+    if(s.half){ s.half=false; return; }                 // second half of a 64-byte vertex / header
+    if(s.hdr64_pending){ s.hdr64_pending=false; return; }
+    const std::uint32_t pcw=q[0];const unsigned t=pcw>>29;
+    if(t==4u||t==5u){
+        if(((pcw>>24)&7)!=list)++scene_mismatch;
+        cur_tsp[list]=q[2];cur_tcw[list]=q[3];
+        s.sprite=t==5u; s.tex=pcw&8; s.uv16=pcw&1; s.offset=pcw&4; s.vol=pcw&64; const unsigned col=(pcw>>4)&3;
+        if(s.nv>0 && s.nv<3)++s.short_strips;
+        s.nv=0;
+        s.hdr64_pending=!s.sprite && ((!s.vol && col==2 && s.tex && s.offset) || (s.vol && col==2));
+        s.vtx64=s.sprite || (s.tex && col==1) || (s.vol && s.tex);
+        s.hdr_words=3+(s.vol?2:0);
+        s.vtx_words=3+(s.tex?(s.uv16?1:2):0)+1+(s.offset?1:0);
+        if(s.vol)s.vtx_words+=(s.tex?(s.uv16?1:2):0)+1+(s.offset?1:0);
+        return;
+    }
+    if(t!=7u)return;                                      // EOL, user clip, object list set
+    if(!s.hdr_words){++s.orphans;return;}
+    const float* f=reinterpret_cast<const float*>(q);
+    if(s.sprite){
+        // A, B, C xyz in words 1..9, D xy in 10..11: words 8.. are in the second half (not kept), so use A and B
+        // and C's x (word 7); D is C's mirror in practice: take the box of A, B and C.x with y of A/B.
+        s.half=true;
+        const float xs[3]={f[1],f[4],f[7]},ys[2]={f[2],f[5]};
+        obj_begin(s); ++s.tris;
+        add_box(list,std::min({xs[0],xs[1],xs[2]}),std::max({xs[0],xs[1],xs[2]}),std::min(ys[0],ys[1]),std::max(ys[0],ys[1]),2);
+        scene_param+=4*4; ++s.verts;
+        return;
+    }
+    if(s.vtx64)s.half=true;
+    ++s.verts;
+    const float x=f[1],y=f[2];
+    if(s.nv>=2){
+        if(s.tri_in_obj==0||s.tri_in_obj==6){ obj_begin(s); scene_param+=2*s.vtx_words; }
+        ++s.tri_in_obj; ++s.tris; scene_param+=s.vtx_words;
+        add_box(list,std::min({x,s.x[0],s.x[1]}),std::max({x,s.x[0],s.x[1]}),std::min({y,s.y[0],s.y[1]}),std::max({y,s.y[0],s.y[1]}),1);
+    }
+    s.x[0]=s.x[1];s.y[0]=s.y[1];s.x[1]=x;s.y[1]=y;++s.nv;
+    if(pcw&(1u<<28)){ if(s.nv<3)++s.short_strips; s.nv=0; s.tri_in_obj=0; }
+}
+void feed(unsigned list,const void* data,unsigned bytes){
+    if(bytes<32||list>4)return;
+    const auto* w=static_cast<const std::uint32_t*>(data);
+    scene_lists_seen|=1u<<list;
+    for(unsigned b=0;b<bytes/32;++b)feed_block(list,w+b*8);
+}
+unsigned pool_now(){
+    unsigned pool=0;
+    for(unsigned l=0;l<5;++l){
+        const unsigned n=blocks_words(l);if(!n)continue;
+        for(unsigned t=0;t<kTiles;++t){const unsigned e=ent[l][t];if(e+1>n)pool+=((e+1-(n-1)+(n-2))/(n-1))*n*4;}
+    }
+    return pool;
+}
+// A VRAM fence inside an open scene (a texture upload): how much of the scene the TA holds at this point, to set
+// a console photo's TA registers (read at such a fence) against the scene's final numbers.
+void partial(unsigned fr){
+    re4dc_log("tabin fence: f=%u param=%u pool=%u tris=%u\n",fr,scene_param*4,pool_now(),ls[0].tris+ls[2].tris+ls[4].tris);
+}
+void scene_end(unsigned fr,bool present){
+    unsigned pool=0,maxent[5]={0,0,0,0,0},total[5]={0,0,0,0,0},maxtr=0,objs[5],tris=0,shorts=0,orph=0;
+    for(unsigned l=0;l<5;++l){
+        const unsigned n=blocks_words(l);objs[l]=ls[l].objs;tris+=ls[l].tris;shorts+=ls[l].short_strips;orph+=ls[l].orphans;
+        for(unsigned t=0;t<kTiles;++t){
+            const unsigned e=ent[l][t];total[l]+=e;maxent[l]=std::max(maxent[l],e);
+            if(n && e+1>n){ const unsigned slots=e+1,first=n-1; pool+=((slots-first+(n-2))/(n-1))*n*4; }
+        }
+    }
+    unsigned trt=0,opt=0;
+    for(unsigned t=0;t<kTiles;++t){
+        if(trtri[t]>maxtr){maxtr=trtri[t];trt=t;}
+        if(ent[0][t]>ent[0][opt])opt=t;
+    }
+    // Every 30th scene (or a new peak): the attribution of the previous scene's busiest tiles.
+    if(!(scenes%30) && hot_tile!=~0U){
+        char b[220];int n=snprintf(b,sizeof(b),"tabin hot: tr tile %u,%u",hot_tile%kTw,hot_tile/kTw);
+        for(unsigned i=0;i<8 && hot[i].ra && n<int(sizeof(b));++i)
+            n+=snprintf(b+n,sizeof(b)-n," %08x:%u/%08x/%08x",unsigned(reinterpret_cast<std::uintptr_t>(hot[i].ra)),hot[i].tris,hot[i].tsp,hot[i].tcw);
+        re4dc_log("%s\n",b);
+        n=snprintf(b,sizeof(b),"tabin hot: op tile %u,%u",hot_op_tile%kTw,hot_op_tile/kTw);
+        for(unsigned i=0;i<8 && hot_op[i].ra && n<int(sizeof(b));++i)
+            n+=snprintf(b+n,sizeof(b)-n," %08x:%u/%08x/%08x",unsigned(reinterpret_cast<std::uintptr_t>(hot_op[i].ra)),hot_op[i].tris,hot_op[i].tsp,hot_op[i].tcw);
+        re4dc_log("%s\n",b);
+    }
+    hot_tile=maxtr?trt:~0U;hot_op_tile=ent[0][opt]?opt:~0U;
+    std::memset(hot,0,sizeof(hot));std::memset(hot_op,0,sizeof(hot_op));
+    const unsigned limit=(2*unsigned(RE4DC_TA_OPB_BINS)+blocks_words(4))*4*kTiles*unsigned(RE4DC_TA_OPB_OVERFLOW);
+    const unsigned param=scene_param*4;
+    ++scenes;
+    const bool peak=pool>max_pool||param>max_param||maxtr>max_trtile;
+    max_pool=std::max(max_pool,pool);max_param=std::max(max_param,param);max_trtile=std::max(max_trtile,maxtr);
+    re4dc_log("tabin: f=%u p=%d obj=%u/%u/%u ent=%u/%u/%u deep=%u/%u/%u pool=%u/%u param=%u/%u trtile=%u tris=%u short=%u orphan=%u wild=%u mism=%u%s\n",
+        fr,present?1:0,objs[0],objs[2],objs[4],total[0],total[2],total[4],maxent[0],maxent[2],maxent[4],pool,limit,param,
+        unsigned(RE4DC_TA_VERTBUF_KB)*1024U,maxtr,tris,shorts,orph,scene_wild,scene_mismatch,peak?" PEAK":"");
+    std::memset(ent,0,sizeof(ent));std::memset(trtri,0,sizeof(trtri));
+    for(auto& s:ls)s=L{};
+    scene_param=scene_wild=scene_mismatch=scene_lists_seen=0;
+}
+}
+#endif
 #endif
 #if RE4DC_TA_DOUBLEBUF
 // TA double buffering at run time (design-doublebuf, KOS pvr_set_vbuf_doublebuf): on in play, off
@@ -777,6 +1391,9 @@ void stream_open() {
         if(ta_double_wanted){
             if(pvr_set_vbuf_doublebuf(true)<0)re4dc_missing("TA double buffer switch refused");
             ta_double=true;ta_double_wanted=false;
+#if RE4DC_PVR_LATCH
+            latch::put('D');
+#endif
             re4dc_log("ta bank: double at frame %u" "\n",frame);
         }
     }
@@ -803,13 +1420,23 @@ void stream_open() {
 #else
     stream_list=PVR_LIST_TR_POLY;
 #endif
+#if RE4DC_PVR_LATCH
+    {bool failed;latch::list_begin_timed(stream_list,failed);if(failed)re4dc_missing("native stream list begin failed");}
+    latch::put('S');latch::bump(latch::kS);
+#else
     if(pvr_list_begin(stream_list)<0)re4dc_missing("native stream list begin failed");
+#endif
 #if RE4DC_TA_HASH
     ta_hash_reset();ta_hash_marker(stream_list);
 #endif
     // Do not retain the main thread's SQ mutex across source task dispatch or
     // file/audio services. Each synchronous packet transfer reacquires it.
     sq_unlock();stream_scene=true;
+#if RE4DC_WORLD_AUTOSORT
+    // list_begin, not scene_begin, waits for and acquires this TA bank.
+    // Set its tiles only after that wait, never while the old bank renders.
+    world_autosort=false;overlay_layer=0;pvr_set_presort_mode(true);
+#endif
 }
 #if RE4DC_D349_RENDERER_STACK
 void stream_select(pvr_list_t list){
@@ -853,6 +1480,16 @@ void stream_select(pvr_list_t list){
 #endif
 }
 #endif
+#if RE4DC_WORLD_AUTOSORT
+void world_sort_begin(){
+    // Subscreen and pickup models deliberately interleave with their 2D art.
+    if(world_autosort || ui_order)return;
+#if RE4DC_ROUTE_MOVIES
+    if(movie_texture && movie_picture)return;
+#endif
+    pvr_set_presort_mode(false);world_autosort=true;
+}
+#endif
 #if RE4DC_POST_F00_DIAG
 // POST_F00_DIAG (test builds): the frame of the last queued post, opaque packets sent after it in that frame
 // (drawn below it on the PVR, above it on the GameCube) and UI quads queued before it (drawn above it here).
@@ -892,14 +1529,22 @@ void stream_close(bool present) {
     const unsigned ta_faults=0;
 #endif
     (void)ta_faults;
-#if RE4DC_TA_HASH
+#if RE4DC_TA_BIN_DIAG
+    tabin::scene_end(frame,present);
+#elif RE4DC_TA_HASH
     re4dc_log("ta_hash: frame=%u present=%u op=%08x/%u tr=%08x/%u pt=%08x/%u mod=%08x/%u,%08x/%u\n",frame,present?1u:0u,
               ta_hash_h[0],ta_hash_words[0],ta_hash_h[2],ta_hash_words[2],ta_hash_h[4],ta_hash_words[4],
               ta_hash_h[1],ta_hash_words[1],ta_hash_h[3],ta_hash_words[3]);
 #endif
+#if RE4DC_PVR_LATCH>=2
+    latch::scene_close();
+#endif
     sq_lock((void*)PVR_TA_INPUT);
     if(pvr_list_finish()<0 || pvr_scene_finish()<0)re4dc_missing("native stream finish failed");
     stream_scene=false;
+#if RE4DC_PVR_LATCH
+    latch::put(present?'c':'d');latch::bump(latch::kC);
+#endif
 #if RE4DC_PVR_PIPELINE
     present_submit(present,ta_faults); // resolved by the presenter; fenced before reuse
 #else
@@ -938,10 +1583,11 @@ void hud_flush(HudBatch& b){if(b.n>1)stream_send(b.v,b.n*32);b.n=1;}
 void hud_rect(HudBatch& b,float x,float y,float w,float h,std::uint32_t argb){
     if(b.n+4>128)hud_flush(b);
     const float xs[4]={x,x,x+w,x+w},ys[4]={y+h,y,y+h,y};
+    const float layer=overlay_depth();
     for(unsigned k=0;k<4;++k){
         auto& v=b.v[b.n++];
         v.flags=k==3?PVR_CMD_VERTEX_EOL:PVR_CMD_VERTEX;
-        v.x=RE4DC_UI_X(xs[k]);v.y=RE4DC_UI_Y(ys[k]);v.z=1.0f;v.u=v.v=0;v.argb=argb;v.oargb=0;
+        v.x=RE4DC_UI_X(xs[k]);v.y=RE4DC_UI_Y(ys[k]);v.z=layer;v.u=v.v=0;v.argb=argb;v.oargb=0;
     }
 }
 void hud_number(HudBatch& b,float x,float y,unsigned value,bool tenths,std::uint32_t argb){
@@ -1928,7 +2574,11 @@ void vram_census(const char* where){
 #if defined(RE4DC_ENC_CENSUS) && RE4DC_ENC_CENSUS
 extern "C" void re4dc_enc_frame(unsigned frame); // ENC_CENSUS (diagnostic): coarse.cpp, one line per frame mark
 #endif
+#if RE4DC_TA_BIN_DIAG
+extern "C" void re4dc_pvr_vram_fence(){if(stream_scene)tabin::partial(frame);present_fence();}
+#else
 extern "C" void re4dc_pvr_vram_fence(){present_fence();}
+#endif
 #endif
 #if RE4DC_PAD_PROMPTS
 extern "C" int re4dc_ui_binocular_prompt(const Re4dcUiImage* original,unsigned kind,Re4dcUiImage* out){
@@ -1961,6 +2611,9 @@ extern "C" void re4dc_ui_ta_single_bank(){
     present_fence();
     if(pvr_set_vbuf_doublebuf(false)<0)re4dc_missing("TA single-bank switch refused");
     ta_double=false;
+#if RE4DC_PVR_LATCH
+    latch::put('s');
+#endif
     re4dc_log("ta bank: single at frame %u (sub screen backing) scene_discarded=%d fence_us=%llu" "\n",frame,open?1:0,
               (unsigned long long)(timer_us_gettime64()-t));
 }
@@ -2442,13 +3095,14 @@ void glyph_draw_run(unsigned first,unsigned count){
         const GlyphQuad& g=glyph_quads[i];
         if(n+5>sizeof(buf)/sizeof(buf[0]))flush();
         if(g.bank!=bank){std::memcpy(&buf[n++],&glyph_header(g.bank),sizeof(pvr_vertex_t));bank=g.bank;}
+        const float layer=overlay_depth();
         constexpr float kH=float(kGlyphAtlasH);
         const float u0=float((g.cell&7)*32)/256.0f,v0=float((g.cell>>3)*32)/kH;
         const float x[4]={g.x0*0.25f,g.x1*0.25f,g.x0*0.25f,g.x1*0.25f},y[4]={g.y0*0.25f,g.y0*0.25f,g.y1*0.25f,g.y1*0.25f};
         const float u[4]={u0,u0+g.cw/256.0f,u0,u0+g.cw/256.0f},v[4]={v0,v0,v0+g.ch/kH,v0+g.ch/kH};
         for(unsigned k=0;k<4;++k){
             pvr_vertex_t& p=buf[n++];
-            p.flags=k==3?PVR_CMD_VERTEX_EOL:PVR_CMD_VERTEX;p.x=RE4DC_UI_X(x[k]);p.y=RE4DC_UI_Y(y[k]);p.z=1.0f;p.u=u[k];p.v=v[k];p.argb=g.argb;p.oargb=0;
+            p.flags=k==3?PVR_CMD_VERTEX_EOL:PVR_CMD_VERTEX;p.x=RE4DC_UI_X(x[k]);p.y=RE4DC_UI_Y(y[k]);p.z=layer;p.u=u[k];p.v=v[k];p.argb=g.argb;p.oargb=0;
         }
         ++glyph_drawn;
     }
@@ -2545,6 +3199,12 @@ extern "C" void re4dc_ui_init(){
 #endif
 #if RE4DC_TA_GUARD
         install_guard();
+#endif
+#if RE4DC_PVR_RECOVER
+        pvr_recover::install();   // above the fast-wake chain, below the latch (a recovery calls the chain below it)
+#endif
+#if RE4DC_PVR_LATCH
+        latch::install();   // after install_fast_wake: chains its render-done handler
 #endif
 #if RE4DC_TA_GUARD || RE4DC_PERF_HUD || RE4DC_TA_VERTBUF_KB!=1024 || RE4DC_TA_DOUBLEBUF || RE4DC_TA_OPB_BINS!=16 || RE4DC_TA_OPB_OVERFLOW!=3
         re4dc_log("native VRAM layout: vertbuf=%u KiB x%u banks (%s) opb_bins=%u overflow=%u texture_pool_free=%u\n",
@@ -2744,7 +3404,8 @@ void pace_note_draw(int mode){
     for(int k=0;k<3;++k){
         const float x=40.0f+k*36,y=40.0f,w=28.0f,h=16.0f;const std::uint32_t argb=k==mode?on[k]:0x60ffffffU;
         const float xs[4]={x,x,x+w,x+w},ys[4]={y+h,y,y+h,y};
-        for(unsigned j=0;j<4;++j){auto& q=v[n++];q.flags=j==3?PVR_CMD_VERTEX_EOL:PVR_CMD_VERTEX;q.x=RE4DC_UI_X(xs[j]);q.y=RE4DC_UI_Y(ys[j]);q.z=1.0f;q.u=q.v=0;q.argb=argb;q.oargb=0;}
+        const float layer=overlay_depth();
+        for(unsigned j=0;j<4;++j){auto& q=v[n++];q.flags=j==3?PVR_CMD_VERTEX_EOL:PVR_CMD_VERTEX;q.x=RE4DC_UI_X(xs[j]);q.y=RE4DC_UI_Y(ys[j]);q.z=layer;q.u=q.v=0;q.argb=argb;q.oargb=0;}
     }
     stream_send(v,n*32);
 }
@@ -2782,8 +3443,9 @@ static void ui_draw_quad(unsigned i){
         alignas(32) pvr_vertex_t commands[5]{};std::uint32_t count;
         re4dc::render::begin_pvr_packet(commands,count,header);
         pvr_vertex_t* v=commands+count;const unsigned order[]={0,1,3,2};
+        const float layer=overlay_depth();
         for(unsigned n=0;n<4;++n){unsigned j=order[n];v[n].flags=n==3?PVR_CMD_VERTEX_EOL:PVR_CMD_VERTEX;
-            v[n].x=RE4DC_UI_X(q.xy[2*j]);v[n].y=RE4DC_UI_Y(q.xy[2*j+1]);v[n].z=1.0f;
+            v[n].x=RE4DC_UI_X(q.xy[2*j]);v[n].y=RE4DC_UI_Y(q.xy[2*j+1]);v[n].z=layer;
             v[n].u=q.uv[2*j]*q.image.width/t.width;v[n].v=q.uv[2*j+1]*q.image.height/t.height;v[n].argb=q.color;}
 #if RE4DC_PVR_STREAM
         stream_send(commands,sizeof(commands));
@@ -2856,8 +3518,9 @@ extern "C" void re4dc_ui_present(){
         alignas(32) pvr_vertex_t commands[5]{};std::uint32_t count;
         re4dc::render::begin_pvr_packet(commands,count,header);
         pvr_vertex_t* v=commands+count;const unsigned order[]={0,1,3,2};
+        const float layer=overlay_depth();
         for(unsigned n=0;n<4;++n){unsigned j=order[n];v[n].flags=n==3?PVR_CMD_VERTEX_EOL:PVR_CMD_VERTEX;
-            v[n].x=RE4DC_UI_X(q.xy[2*j]);v[n].y=RE4DC_UI_Y(q.xy[2*j+1]);v[n].z=1.0f;
+            v[n].x=RE4DC_UI_X(q.xy[2*j]);v[n].y=RE4DC_UI_Y(q.xy[2*j+1]);v[n].z=layer;
             v[n].u=q.uv[2*j]*q.image.width/t.width;v[n].v=q.uv[2*j+1]*q.image.height/t.height;v[n].argb=q.color;}
 #if RE4DC_PVR_STREAM
         stream_send(commands,sizeof(commands));
@@ -3402,6 +4065,10 @@ extern "C" int re4dc_model_direct_enabled(){return RE4DC_TA_DIRECT;}
 #if RE4DC_TA_HASH
 extern "C" void re4dc_ta_hash(const void* data,unsigned bytes){
     const unsigned l=(unsigned)stream_list<5?(unsigned)stream_list:2;
+#if RE4DC_TA_BIN_DIAG
+    tabin::cur_ra=__builtin_return_address(0);
+    tabin::feed(l,data,bytes);
+#endif
     const auto* w=static_cast<const std::uint32_t*>(data);
     std::uint32_t h=ta_hash_h[l];
 #if RE4DC_TA_HASH == 3
@@ -3922,6 +4589,17 @@ struct FxHeaderKey{unsigned fmt,w,h;const void* txr;unsigned char src,dst,screen
 FxHeaderKey fx_hdr_key{~0U,0,0,nullptr,0,0,0};
 alignas(32) pvr_poly_hdr_t fx_hdr_cache;
 #endif
+void fx_send(unsigned char* packet,bool screen){
+#if RE4DC_WORLD_AUTOSORT
+    if(world_autosort && screen){
+        auto* b=reinterpret_cast<pvr_sprite_txr_t*>(packet+sizeof(pvr_poly_hdr_t));
+        b->az=b->bz=b->cz=overlay_depth();
+    }
+#else
+    (void)screen;
+#endif
+    stream_send(packet,kSpritePacket);
+}
 void fx_packet(const Re4dcEffectSprite& s,Entry* e,unsigned char* out){
     const auto& t=e->package.textures()[0];
     auto* h=reinterpret_cast<pvr_poly_hdr_t*>(out);
@@ -4021,7 +4699,7 @@ extern "C" int re4dc_effect_sprite(const Re4dcEffectSprite* s){
     if(!e){++fx_missing;return 0;}
     if(source_draws_finished){
         alignas(32) unsigned char packet[kSpritePacket];fx_packet(*s,e,packet);
-        stream_select(PVR_LIST_TR_POLY);stream_send(packet,kSpritePacket);
+        stream_select(PVR_LIST_TR_POLY);fx_send(packet,s->screen);
         ++fx_direct;++fx_count;return 1;
     }
     const unsigned required=kSpriteNode+kSpritePacket,margin=8192;
@@ -4033,7 +4711,7 @@ extern "C" int re4dc_effect_sprite(const Re4dcEffectSprite* s){
         storage=deferred_spill;top=&deferred_spill_top;
     }
     *top-=required;
-    auto* node=new(storage+*top) DeferredPart{};node->lighting=kSpriteTag;
+    auto* node=new(storage+*top) DeferredPart{};node->lighting=kSpriteTag;node->changed[0]=s->screen;
     fx_packet(*s,e,storage+*top+kSpriteNode);
     if(deferred_last)deferred_last->next=node;else deferred_first=node;
     deferred_last=node;++deferred_count;++fx_queued;++fx_count;
@@ -4136,6 +4814,66 @@ extern "C" int re4dc_subscreen_line(const Re4dcSubscreenQuad* q,unsigned width){
     pvr_vertex_t vertices[12];
     return subscreen_submit(q,vertices,re4dc::subscreen::line_vertices(*q,width,vertices));
 }
+#if defined(RE4DC_WATER45_NATIVE) && RE4DC_WATER45_NATIVE
+// WATER45_NATIVE (ROUTE_CH13, r10b; espgen45.cpp re4dc_water45_draw): one view-space cell of the open-air
+// water surface. The GameCube draws the scene behind the water (its screen copy) times the TEV colour, alpha
+// blended by the raster alpha; here the same product is the PVR multiply blend (DESTCOLOR, ZERO) with the
+// per-corner factor rgb (owner-computed: alpha mix and fog fade to 1). Untextured, Gouraud, no fog (the
+// factor carries it), depth tested, no depth write; queued in source OT order like the subscreen quads.
+extern "C" int re4dc_water45_quad(const float positions[4][3],const float rgb[4][3],const float* projection,
+                                  const float* viewport){
+    if(!frame_ready || stream_aborted || draining_parts)return 0;
+    Re4dcSubscreenQuad q;
+    std::memcpy(q.positions,positions,sizeof(q.positions));
+    std::memcpy(q.projection,projection,sizeof(q.projection));
+    std::memcpy(q.viewport,viewport,sizeof(q.viewport));
+    q.color=0xFFFFFFFFU;q.blend=0;q.depth_test=1;
+    if(q.projection[0]!=0 || q.viewport[2]<=0 || q.viewport[3]<=0)return 0;
+    for(float f:q.projection)if(!re4dc::render::is_finite(f))return 0;
+    for(float f:q.viewport)if(!re4dc::render::is_finite(f))return 0;
+    for(const auto& p:q.positions)for(float f:p)if(!re4dc::render::is_finite(f))return 0;
+    const float near=q.projection[6]/(q.projection[5]-1),far=q.projection[6]/q.projection[5];
+    if(!re4dc::render::is_finite(near) || !re4dc::render::is_finite(far) || near<=0 || far<=near)return 0;
+    re4dc::render::ClipParameters clip{near,far,RE4DC_SCREEN_WF,RE4DC_SCREEN_HF,re4dc::subscreen::project,&q};
+    re4dc::render::RenderVertex v[4]{};
+    for(unsigned i=0;i<4;++i){
+        auto& p=v[i].position;
+        p.world_x=p.x=q.positions[i][0];p.world_y=p.y=q.positions[i][1];p.world_z=p.z=q.positions[i][2];
+        p.depth=-p.world_z;
+        if(p.depth>=near)re4dc::subscreen::project(p.x,p.y,p.z,&q);
+        v[i].light_red=rgb[i][0];v[i].light_green=rgb[i][1];v[i].light_blue=rgb[i][2];
+    }
+    alignas(32) pvr_vertex_t packet[13];
+    constexpr unsigned strips[2][3]={{0,1,2},{2,1,3}};
+    unsigned used=0;
+    for(const auto& indices:strips){
+        const re4dc::render::RenderVertex tri[]={v[indices[0]],v[indices[1]],v[indices[2]]};
+        used+=3*re4dc::render::clip_projected_triangle(tri,packet+1+used,0,clip);
+    }
+    if(!used)return 0;
+    pvr_poly_cxt_t c;pvr_poly_cxt_col(&c,PVR_LIST_TR_POLY);
+    c.gen.culling=PVR_CULLING_NONE;c.gen.shading=PVR_SHADE_GOURAUD;c.gen.fog_type=PVR_FOG_DISABLE;
+    c.depth.comparison=PVR_DEPTHCMP_GEQUAL;c.depth.write=PVR_DEPTHWRITE_DISABLE;
+    c.blend.src=PVR_BLEND_DESTCOLOR;c.blend.dst=PVR_BLEND_ZERO;
+    pvr_poly_compile(reinterpret_cast<pvr_poly_hdr_t*>(packet),&c);
+    const unsigned bytes=(used+1)*sizeof(pvr_vertex_t);
+    if(source_draws_finished){stream_select(PVR_LIST_TR_POLY);stream_send(packet,bytes);return 1;}
+    const unsigned required=kSubscreenQuadNode+bytes,margin=8192;
+    unsigned char* storage=frame_storage;unsigned* top=&deferred_top;
+    if(required+margin>deferred_top || deferred_top-required-margin<std::max(8192U,nquad*unsigned(sizeof(Re4dcUiQuad)))){
+        if(!deferred_spill){deferred_spill=static_cast<unsigned char*>(re4dc_model_deferred_storage(&deferred_spill_capacity));deferred_spill_top=deferred_spill_capacity;}
+        if(!deferred_spill || required>deferred_spill_top){++dropped;return 0;}
+        storage=deferred_spill;top=&deferred_spill_top;
+    }
+    *top-=required;auto* node=new(storage+*top) DeferredPart{};
+    node->lighting=kSubscreenQuadTag;node->changed[0]=bytes;
+    std::memcpy(storage+*top+kSubscreenQuadNode,packet,bytes);
+    if(deferred_last)deferred_last->next=node;else deferred_first=node;
+    deferred_last=node;++deferred_count;
+    frame_queue_peak=std::max(frame_queue_peak,unsigned(sizeof(frame_storage))-deferred_top+deferred_spill_capacity-deferred_spill_top);
+    return 1;
+}
+#endif
 #else
 extern "C" int re4dc_subscreen_quad(const Re4dcSubscreenQuad*){return 0;}
 extern "C" int re4dc_subscreen_line(const Re4dcSubscreenQuad*,unsigned){return 0;}
@@ -4170,6 +4908,15 @@ void post_pass(unsigned char* out,pvr_blend_mode_t src,pvr_blend_mode_t dst,unsi
         v[k].flags=k==3?PVR_CMD_VERTEX_EOL:PVR_CMD_VERTEX;v[k].x=xs[k];v[k].y=ys[k];v[k].z=1.0f;
         v[k].u=v[k].v=0;v[k].argb=argb;v[k].oargb=0;
     }
+}
+void post_send(unsigned char* packet,unsigned bytes){
+#if RE4DC_WORLD_AUTOSORT
+    if(world_autosort)for(unsigned offset=0;offset<bytes;offset+=kPostPass){
+        auto* v=reinterpret_cast<pvr_vertex_t*>(packet+offset+sizeof(pvr_poly_hdr_t));
+        const float layer=overlay_depth();for(unsigned i=0;i<4;++i)v[i].z=layer;
+    }
+#endif
+    stream_send(packet,bytes);
 }
 void post_packet(unsigned char* out){
     post_pass(out,PVR_BLEND_DESTCOLOR,PVR_BLEND_ONE,post_c);                    // d + c d
@@ -4216,7 +4963,7 @@ extern "C" void re4dc_post_filter00(unsigned char rate,unsigned char type,signed
 #endif
     if(source_draws_finished){
         alignas(32) unsigned char packet[kPostBytes];post_packet(packet);
-        stream_select(PVR_LIST_TR_POLY);stream_send(packet,kPostBytes);++post_direct;return;
+        stream_select(PVR_LIST_TR_POLY);post_send(packet,kPostBytes);++post_direct;return;
     }
     const unsigned required=kPostNode+kPostBytes,margin=8192;
     unsigned char* storage=frame_storage;unsigned* top=&deferred_top;
@@ -4230,6 +4977,99 @@ extern "C" void re4dc_post_filter00(unsigned char rate,unsigned char type,signed
     post_packet(storage+*top+kPostNode);
     if(deferred_last)deferred_last->next=node;else deferred_first=node;
     deferred_last=node;++deferred_count;++post_queued;
+    frame_queue_peak=std::max(frame_queue_peak,unsigned(sizeof(frame_storage))-deferred_top+deferred_spill_capacity-deferred_spill_top);
+}
+#endif
+#if defined(RE4DC_LOOK_TOGGLE)
+#if !RE4DC_D349_RENDERER_STACK || !RE4DC_PVR_STREAM
+#error LOOK_TOGGLE: the grade quad needs the D349 renderer stack and PVR_STREAM (deferred translucent queue)
+#endif
+namespace {
+// LOOK_TOGGLE GM / GA (look study 2026-10-10): one full-screen translucent quad, blend (DESTCOLOR, ZERO), colour c:
+// d -> d c per channel in the 8-bit tile buffer before the RGB565 write-out. Queued at Filter00Render's OT slot (as
+// POST_F00), so the scenery, actors and translucent parts drawn before it are graded and the HUD is not.
+DeferredLighting* const kGradeTag=reinterpret_cast<DeferredLighting*>(6); // unique: 1 sprite, 2 post, 3 laser line, 4 sub screen
+constexpr unsigned kGradeNode=(sizeof(DeferredPart)+31)&~31U,kGradeBytes=sizeof(pvr_poly_hdr_t)+4*sizeof(pvr_vertex_t);
+unsigned grade_queued,grade_direct,grade_dropped;
+void grade_packet(unsigned char* out,std::uint32_t argb){
+    pvr_poly_cxt_t c;pvr_poly_cxt_col(&c,PVR_LIST_TR_POLY);
+    c.gen.culling=PVR_CULLING_NONE;c.depth.comparison=PVR_DEPTHCMP_ALWAYS;c.depth.write=PVR_DEPTHWRITE_DISABLE;
+    c.blend.src=PVR_BLEND_DESTCOLOR;c.blend.dst=PVR_BLEND_ZERO;
+    pvr_poly_compile(reinterpret_cast<pvr_poly_hdr_t*>(out),&c);
+    auto* v=reinterpret_cast<pvr_vertex_t*>(out+sizeof(pvr_poly_hdr_t));
+    const float xs[4]={0,0,640,640},ys[4]={480,0,480,0};
+    for(unsigned k=0;k<4;++k){
+        v[k].flags=k==3?PVR_CMD_VERTEX_EOL:PVR_CMD_VERTEX;v[k].x=xs[k];v[k].y=ys[k];v[k].z=1.0f;
+        v[k].u=v[k].v=0;v[k].argb=argb;v[k].oargb=0;
+    }
+}
+void grade_send(unsigned char* packet,unsigned bytes){
+#if RE4DC_WORLD_AUTOSORT
+    if(world_autosort)for(unsigned off=0;off<bytes;off+=kGradeBytes){
+        auto* v=reinterpret_cast<pvr_vertex_t*>(packet+off+sizeof(pvr_poly_hdr_t));
+        const float layer=overlay_depth();for(unsigned i=0;i<4;++i)v[i].z=layer;}
+#endif
+    stream_send(packet,bytes);
+}
+// The preset label: the BIOS font (bfont, 12x24, as the crash screen) rendered into a 512x32 RGB565 texture when
+// the text changes (32 KiB of VRAM, allocated on first use; no label if that fails), drawn as one quad in the top
+// picture top-left corner (y 66..98, under the top letterbox bar the game draws over y < 60; the HUD is bottom right).
+constexpr unsigned kOsdW=512,kOsdH=32;
+pvr_ptr_t osd_vram;const char* osd_loaded;bool osd_failed;
+bool osd_texture(const char* text){
+    if(osd_failed)return false;
+    if(!osd_vram){osd_vram=pvr_mem_malloc(kOsdW*kOsdH*2);if(!osd_vram){osd_failed=true;re4dc_log("look label: no VRAM\n");return false;}}
+    if(text!=osd_loaded){
+        static unsigned short buf[kOsdW*kOsdH];
+        memset(buf,0,sizeof(buf));bfont_draw_str_ex(buf+4*kOsdW+4,kOsdW,0xFFFFU,0,16,1,text);
+        pvr_txr_load(buf,osd_vram,sizeof(buf));osd_loaded=text;
+        re4dc_log("look label: '%s' vram=%p frame=%u\n",text,(void*)osd_vram,frame);
+    }
+    return true;
+}
+void osd_packet(unsigned char* out){
+    pvr_poly_cxt_t c;pvr_poly_cxt_txr(&c,PVR_LIST_TR_POLY,PVR_TXRFMT_RGB565|PVR_TXRFMT_NONTWIDDLED,kOsdW,kOsdH,osd_vram,PVR_FILTER_NONE);
+    c.gen.culling=PVR_CULLING_NONE;c.depth.comparison=PVR_DEPTHCMP_ALWAYS;c.depth.write=PVR_DEPTHWRITE_DISABLE;
+    c.blend.src=PVR_BLEND_ONE;c.blend.dst=PVR_BLEND_ZERO;c.gen.fog_type=PVR_FOG_DISABLE;
+    pvr_poly_compile(reinterpret_cast<pvr_poly_hdr_t*>(out),&c);
+    auto* v=reinterpret_cast<pvr_vertex_t*>(out+sizeof(pvr_poly_hdr_t));
+    const float w=float(std::min(kOsdW,unsigned(strlen(osd_loaded))*12U+8U)),u1=w/float(kOsdW); // the text's width only
+    const float x0=20,y0=66,xs[4]={x0,x0,x0+w,x0+w},ys[4]={y0+kOsdH,y0,y0+kOsdH,y0},us[4]={0,0,u1,u1},vs[4]={1,0,1,0};
+    for(unsigned k=0;k<4;++k){
+        v[k].flags=k==3?PVR_CMD_VERTEX_EOL:PVR_CMD_VERTEX;v[k].x=xs[k];v[k].y=ys[k];v[k].z=1.0f;
+        v[k].u=us[k];v[k].v=vs[k];v[k].argb=0xffffffffU;v[k].oargb=0;
+    }
+}
+}
+extern "C" unsigned re4dc_look_grade_argb(void);
+extern "C" const char* re4dc_look_osd_text(void);
+extern "C" void re4dc_look_grade_post(void){
+    const unsigned argb=re4dc_look_grade_argb();
+    const char* text=re4dc_look_osd_text();
+    if((!argb && !text) || !frame_ready || stream_aborted || draining_parts)return;
+    const bool osd=text && osd_texture(text);
+    if(!argb && !osd)return;
+    const unsigned bytes=(argb?kGradeBytes:0U)+(osd?kGradeBytes:0U);
+    if(source_draws_finished){
+        alignas(32) unsigned char packet[2*kGradeBytes];
+        if(argb)grade_packet(packet,argb);
+        if(osd)osd_packet(packet+(argb?kGradeBytes:0U));
+        stream_select(PVR_LIST_TR_POLY);grade_send(packet,bytes);++grade_direct;return;
+    }
+    const unsigned required=kGradeNode+bytes,margin=8192;
+    unsigned char* storage=frame_storage;unsigned* top=&deferred_top;
+    if(required+margin>deferred_top || deferred_top-required-margin<std::max(8192U,nquad*unsigned(sizeof(Re4dcUiQuad)))){
+        if(!deferred_spill){deferred_spill=static_cast<unsigned char*>(re4dc_model_deferred_storage(&deferred_spill_capacity));deferred_spill_top=deferred_spill_capacity;}
+        if(!deferred_spill || required>deferred_spill_top){++grade_dropped;return;}
+        storage=deferred_spill;top=&deferred_spill_top;
+    }
+    *top-=required;
+    auto* node=new(storage+*top) DeferredPart{};node->lighting=kGradeTag;node->changed[0]=bytes;
+    if(argb)grade_packet(storage+*top+kGradeNode,argb);
+    if(osd)osd_packet(storage+*top+kGradeNode+(argb?kGradeBytes:0U));
+    if(deferred_last)deferred_last->next=node;else deferred_first=node;
+    deferred_last=node;++deferred_count;
+    if(!(grade_queued++%1800))re4dc_log("look grade: argb=%08x queued=%u direct=%u dropped=%u\n",argb,grade_queued,grade_direct,grade_dropped);
     frame_queue_peak=std::max(frame_queue_peak,unsigned(sizeof(frame_storage))-deferred_top+deferred_spill_capacity-deferred_spill_top);
 }
 #endif
@@ -4299,6 +5139,9 @@ extern "C" int re4dc_ps2_world_packet(unsigned crc,unsigned fnv,unsigned width,u
     if(t.width!=width || t.height!=height)return 0; // repeated UVs cannot use padding
     const pvr_list_t list=pass==0?PVR_LIST_OP_POLY:pass==1?PVR_LIST_PT_POLY:PVR_LIST_TR_POLY;
     stream_select(list);
+#if RE4DC_WORLD_AUTOSORT
+    world_sort_begin();
+#endif
     if(stream_aborted)return 0;
     pvr_poly_cxt_t c;pvr_poly_cxt_txr(&c,list,re4dc::texture::pvr_format(t),t.width,t.height,handle->package.pvr_texture(0),PVR_FILTER_BILINEAR);
     c.gen.culling=PVR_CULLING_NONE; // authored cull already applied after clipping
@@ -4333,6 +5176,9 @@ extern "C" int re4dc_ps2_world_packet_cull(unsigned crc,unsigned fnv,unsigned wi
     if(t.width!=width || t.height!=height)return 0; // repeated UVs cannot use padding
     const pvr_list_t list=pass==0?PVR_LIST_OP_POLY:pass==1?PVR_LIST_PT_POLY:PVR_LIST_TR_POLY;
     stream_select(list);
+#if RE4DC_WORLD_AUTOSORT
+    world_sort_begin();
+#endif
     if(stream_aborted)return 0;
     pvr_poly_cxt_t c;pvr_poly_cxt_txr(&c,list,re4dc::texture::pvr_format(t),t.width,t.height,handle->package.pvr_texture(0),PVR_FILTER_BILINEAR);
     // PS2_WORLD_KERNEL=4 strips: the authored cull (0 drops screen area >= 0, i.e. clockwise with y down).
@@ -4406,6 +5252,15 @@ static void ps2_check_header(pvr_poly_hdr_t& header){
     hw[2]=(hw[2]&~std::uint32_t(PVR_TA_PM2_FOG))|FIELD_PREP(PVR_TA_PM2_FOG,PVR_FOG_DISABLE);
 }
 #endif
+#if defined(RE4DC_SKY_FAR) || defined(RE4DC_LOOK_TOGGLE)
+// SKY_FAR=2 (post30.mk, look study): the sky / backdrop rows' headers with the table fog off (words 0..3 after
+// the compile or the header cache, as ps2_check_header).
+extern "C" unsigned re4dc_ps2_sky_header; // native_static.cpp ps2_pass
+static void ps2_sky_header(pvr_poly_hdr_t& header){
+    auto* hw=reinterpret_cast<std::uint32_t*>(&header);
+    hw[2]=(hw[2]&~std::uint32_t(PVR_TA_PM2_FOG))|FIELD_PREP(PVR_TA_PM2_FOG,PVR_FOG_DISABLE);
+}
+#endif
 extern "C" int re4dc_ps2_world_direct_begin(const unsigned* k,Re4dcModelDirect* out){
 #if RE4DC_TA_DIRECT
     if(direct_open){re4dc_missing("native direct part nested");return 0;}
@@ -4442,6 +5297,9 @@ extern "C" int re4dc_ps2_world_direct_begin(const unsigned* k,Re4dcModelDirect* 
         const unsigned pass=k[4];
         const pvr_list_t list=pass==0?PVR_LIST_OP_POLY:pass==1?PVR_LIST_PT_POLY:PVR_LIST_TR_POLY;
         stream_select(list);
+#if RE4DC_WORLD_AUTOSORT
+        world_sort_begin();
+#endif
         if(stream_aborted)return 0;
         pvr_poly_hdr_t header;
         auto* hw=reinterpret_cast<std::uint32_t*>(&header);
@@ -4481,6 +5339,9 @@ extern "C" int re4dc_ps2_world_direct_begin(const unsigned* k,Re4dcModelDirect* 
 #if RE4DC_PS2_INTERIOR_CULL==2
         if(re4dc_ps2_check_header)ps2_check_header(header);
 #endif
+#if defined(RE4DC_SKY_FAR) || defined(RE4DC_LOOK_TOGGLE)
+        if(re4dc_ps2_sky_header)ps2_sky_header(header);
+#endif
         std::uint32_t count;re4dc::render::begin_pvr_packet(model_packets+model_used,count,header);
         model_pending=model_used+count;model_handle=handle;
         if(!stream_scene)stream_open();
@@ -4507,6 +5368,9 @@ extern "C" int re4dc_ps2_world_direct_begin(const unsigned* k,Re4dcModelDirect* 
     const unsigned pass=k[4];
     const pvr_list_t list=pass==0?PVR_LIST_OP_POLY:pass==1?PVR_LIST_PT_POLY:PVR_LIST_TR_POLY;
     stream_select(list);
+#if RE4DC_WORLD_AUTOSORT
+    world_sort_begin();
+#endif
     if(stream_aborted)return 0;
     pvr_poly_cxt_t c;pvr_poly_cxt_txr(&c,list,re4dc::texture::pvr_format(t),t.width,t.height,handle->package.pvr_texture(0),PVR_FILTER_BILINEAR);
     const pvr_cull_mode_t cull[]={PVR_CULLING_NONE,PVR_CULLING_CCW,PVR_CULLING_CW};
@@ -4538,6 +5402,9 @@ extern "C" int re4dc_ps2_world_direct_begin(const unsigned* k,Re4dcModelDirect* 
 #endif
 #if RE4DC_PS2_INTERIOR_CULL==2
     if(re4dc_ps2_check_header)ps2_check_header(header);
+#endif
+#if defined(RE4DC_SKY_FAR) || defined(RE4DC_LOOK_TOGGLE)
+    if(re4dc_ps2_sky_header)ps2_sky_header(header);
 #endif
     std::uint32_t count;re4dc::render::begin_pvr_packet(model_packets+model_used,count,header);
     model_pending=model_used+count;model_handle=handle;
@@ -4588,8 +5455,9 @@ extern "C" void re4dc_model_finish_source_draws(){
 #endif
 #if RE4DC_EFFECT_SPRITES
         if(deferred_first->lighting==kSpriteTag){
-            const auto* packet=reinterpret_cast<const unsigned char*>(deferred_first)+kSpriteNode;
-            deferred_first=deferred_first->next;stream_send(packet,kSpritePacket);continue;
+            auto* packet=reinterpret_cast<unsigned char*>(deferred_first)+kSpriteNode;
+            const bool screen=deferred_first->changed[0]!=0;
+            deferred_first=deferred_first->next;fx_send(packet,screen);continue;
         }
 #if defined(RE4DC_NATIVE_LASER) && RE4DC_NATIVE_LASER
         if(deferred_first->lighting==kLineTag){
@@ -4598,11 +5466,18 @@ extern "C" void re4dc_model_finish_source_draws(){
         }
 #endif
 #endif
+#if defined(RE4DC_LOOK_TOGGLE)
+        if(deferred_first->lighting==kGradeTag){
+            auto* packet=reinterpret_cast<unsigned char*>(deferred_first)+kGradeNode;
+            const unsigned bytes=deferred_first->changed[0];
+            deferred_first=deferred_first->next;grade_send(packet,bytes);continue;
+        }
+#endif
 #if RE4DC_POST_F00
         if(deferred_first->lighting==kPostTag){
-            const auto* packet=reinterpret_cast<const unsigned char*>(deferred_first)+kPostNode;
+            auto* packet=reinterpret_cast<unsigned char*>(deferred_first)+kPostNode;
             const unsigned bytes=deferred_first->changed[0];
-            deferred_first=deferred_first->next;stream_send(packet,bytes);continue;
+            deferred_first=deferred_first->next;post_send(packet,bytes);continue;
         }
 #endif
         // Copy the small view before I/O can yield. Retirement clears the queue
@@ -4685,7 +5560,29 @@ extern "C" int re4dc_ui_movie_upload_begin(){
 #if RE4DC_PVR_PIPELINE
     present_fence();
 #endif
+#if RE4DC_PVR_RECOVER
+    // PVR_RECOVER: the movie upload fence (gpu::quiesce: KOS pvr_wait_ready / pvr_wait_render_done, 100 ms each)
+    // gave up on a busy TA bank (r119 s30, r117 lane: terminal 3, nothing uploaded). Here it waits in the same
+    // bounded, recovering 100 ms slices as the scene starts (K TA bank, Q render done); same result when not busy.
+    {
+        const bool ta=pvr_ready::wait_clear(pvr_state.ta_busy,"re4dc movie TA bank",'K',pvr_ready::ta_timeouts);
+        const bool rd=ta && pvr_ready::wait_clear(pvr_state.render_busy,"re4dc movie render",'Q',pvr_ready::render_timeouts);
+        if(!ta || !rd)re4dc_log("route movie upload fence: strict wait failed ta=%d render=%d\n",ta?1:0,rd?1:0);
+        return ta && rd;
+    }
+#endif
+#if RE4DC_MOVIE_FENCE_RETRY
+    // A not-ready fence on the first picture ended r119 s30 (terminal=3, uploaded=0) in one image
+    // layout (r118 lane, 2026-10-10): retry before failing the movie. Timing only.
+    for(int attempt=0;;++attempt){
+        const auto qr=re4dc::gpu::quiesce();
+        if(qr==re4dc::gpu::FenceResult::ready)return 1;
+        re4dc_log("route movie upload fence: result=%d attempt=%d\n",(int)qr,attempt);
+        if(attempt>=3)return 0;
+    }
+#else
     return re4dc::gpu::quiesce()==re4dc::gpu::FenceResult::ready;
+#endif
 }
 // movie_width active UYVY pixels per 1024-byte texture row; padding is never sampled.
 extern "C" void re4dc_ui_movie_upload_rows(const void* uyvy,unsigned y,unsigned rows){

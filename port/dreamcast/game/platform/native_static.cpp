@@ -171,6 +171,153 @@ static volatile unsigned ps2_mask_select=1U+RE4DC_PS2_PASS_MASK_SELECT;
 #ifndef RE4DC_FOG_BACKGROUND
 #define RE4DC_FOG_BACKGROUND 1 // background colour follows the fog colour while fog is on
 #endif
+// Look knobs (post30.mk, look study 2026-10-10; all off = the previous image): FOG_CURVE, FOG_CAP, FOG_RGB_PCT,
+// SKY_FAR at build time, or LOOK_TOGGLE's runtime presets (hold X + press START; warp `look <n>`).
+#if defined(RE4DC_FOG_CURVE) || defined(RE4DC_FOG_RGB_PCT) || defined(RE4DC_LOOK_TOGGLE)
+#define RE4DC_LOOK_ANY 1
+#else
+#define RE4DC_LOOK_ANY 0
+#endif
+#if defined(RE4DC_LOOK_TOGGLE)
+// Presets: curve, cap %, fog colour %, sky (0 culled, 1 drawn + table fog, 2 drawn unfogged), effect flags
+// (EFFECT_PS2_TOGGLE builds: 1 fade clamp, 2 PS2 haze, 4 PS2 light shafts; 7 = the play build), grade (1: the r100
+// outdoor colour match, one full-screen multiply quad, native_ui.cpp re4dc_look_grade_post), soft (PVR scaler vertical
+// filter: 0 as KOS set it at boot, 1 forced on = VSCALE 1025, 2 forced off = 1024), VMU label.
+// Disc 2 order (look study 2026-10-10): GD first (the new base), then its variants, DC last for reference.
+struct Re4dcLook { unsigned char curve,cap,rgb,sky,fx,grade,soft; char label[3]; const char* text; };
+static const Re4dcLook re4dc_looks[]={
+    {1,100, 70,1,7,0,0,"GD","GD: GC fog, fog colour 70%"},   // GameCube fog curve + sky / treeline, fog colour 70 %
+    {1,100, 70,1,7,1,0,"GM","GM: GD + r100 colour match"},   // GD + the r100 outdoor brightness / colour match
+    {1,100, 70,1,7,0,1,"GS","GS: GD + flicker filter on"},   // GD + the PVR vertical flicker filter forced on
+    {1,100, 70,1,7,1,1,"GA","GA: GC fog + r100 colour + filter"},   // GD + match + filter
+    {0,100,100,0,7,0,0,"DC","DC: current look"},             // the play build's look (as the knobs-off image)
+    {1,100, 70,1,7,0,2,"GX","GX: GD, flicker filter off"},   // GD with the vertical filter forced OFF
+#if defined(RE4DC_CHARBAKE_TOGGLE) && RE4DC_CHARBAKE_TOGGLE
+    // charbake (charbake.mk CHARBAKE_TOGGLE): the DC look with each character texture variant (re4dc_look_chr)
+    {0,100,100,0,7,0,0,"CA","CA: DC + characters AO"},     // ambient occlusion baked into Leon + Ganados
+    {0,100,100,0,7,0,0,"CS","CS: DC + characters AO + sky"},   // AO + soft sky / ground light
+    {0,100,100,0,7,0,0,"CG","CG: DC + characters GC bright"},  // SKY graded toward the GameCube (hair too)
+    {0,100,100,0,7,0,0,"CV","CV: DC + Leon VQ texture"},   // Leon atlas as VQ (66 KB VRAM, not 524), play shading
+    {0,100,100,0,7,0,0,"CQ","CQ: CG with Leon VQ"},        // CG with Leon atlas as VQ
+#endif
+};
+constexpr unsigned kLooks=sizeof(re4dc_looks)/sizeof(re4dc_looks[0]);
+#if defined(RE4DC_CHARBAKE_TOGGLE) && RE4DC_CHARBAKE_TOGGLE
+#include "../charbake_variants.h"
+extern "C" void re4dc_charbake_set(unsigned variant);  // coarse_actor.cpp (charbake.mk CHARBAKE_TOGGLE)
+// The character variant of a preset: the last kCharbakeLooks presets are charbake_variants.h rows 1.. in order,
+// every other preset draws the play textures (row 0).
+constexpr unsigned kCharbakeLooks=5;
+static_assert(re4dc_charbake::kCount==kCharbakeLooks+1,"one look preset per charbake variant");
+static unsigned re4dc_look_chr(unsigned mode){return mode+kCharbakeLooks>=kLooks ? mode+kCharbakeLooks+1-kLooks : 0;}
+static unsigned re4dc_look_chr_last; // the variant the presets last set (0 at boot)
+#endif
+extern "C" { unsigned re4dc_look_mode; }
+#if defined(RE4DC_EFFECT_PS2_TOGGLE) && RE4DC_EFFECT_PS2_TOGGLE
+extern "C" void re4dc_ps2fx_set(unsigned flags);
+#endif
+#include "pvr_internal.h"   // KOS pvr_state.render_busy (post30.mk LOOK_TOGGLE: -I$(KOS_BASE)/kernel/arch/dreamcast/hardware/pvr)
+static unsigned re4dc_look_scaler_boot=~0U; // PVR_SCALER_CFG as KOS left it (vertical filter on for 480i TV)
+static bool re4dc_look_applied;
+// Issue #11 (console, VGA box, 2026-10-10): stepping to GS hung the PVR (render started, never finished; error
+// bits ISP + OPB out of memory). The preset wrote SCALER_CFG from the pad poll, i.e. at any point of a render: the
+// ISP/TSP write-out reads the vertical scale factor while it renders, and on VGA KOS never enables the vertical
+// filter at all (pvr_init: VSCALE 1024 for VGA, 1025 only for interlaced TV), so GS switched the scaler on in a mode
+// the port never runs it in, mid-render. Now (render only, LOOK_TOGGLE builds only):
+// - VGA: SCALER_CFG is never written (GS / GA / GX change nothing there);
+// - an unchanged value is not written (GS / GA on a TV, where KOS already set 1025);
+// - a real change (GX on a TV, and back) is applied in the ISP render-done interrupt, after KOS's handler, only
+//   while no render is in flight (pvr_state.render_busy clear, interrupts off: renders start only from the PVR
+//   interrupts / vblank, so none can start under the write). The next render is the first to use it.
+static volatile unsigned re4dc_look_scaler_want=~0U,re4dc_look_scaler_writes;
+static asic_evt_handler_entry_t re4dc_look_kos_done;
+static bool re4dc_look_chained;
+static void re4dc_look_render_done(uint32_t code,void* data){
+    (void)data;
+    if(re4dc_look_kos_done.hdl)re4dc_look_kos_done.hdl(code,re4dc_look_kos_done.data);
+    const unsigned w=re4dc_look_scaler_want;
+    if(w==~0U || pvr_state.render_busy)return;
+    PVR_SET(PVR_SCALER_CFG,w);re4dc_look_scaler_want=~0U;re4dc_look_scaler_writes=re4dc_look_scaler_writes+1;
+}
+static const char* re4dc_look_scaler_request(unsigned cfg){
+    if(vid_mode && vid_mode->cable_type==CT_VGA){re4dc_look_scaler_want=~0U;return "vga: scaler untouched";}
+    const int o=irq_disable();
+    const bool same=unsigned(PVR_GET(PVR_SCALER_CFG))==cfg;
+    re4dc_look_scaler_want=same?~0U:cfg;
+    if(!same && !re4dc_look_chained){
+        re4dc_look_kos_done=asic_evt_set_handler(ASIC_EVT_PVR_RENDERDONE_TSP,re4dc_look_render_done,nullptr);
+        re4dc_look_chained=true;
+    }
+    irq_restore(o);
+    return same?"unchanged":"queued for render done";
+}
+// On-screen label (native_ui.cpp re4dc_look_grade_post draws it in the top letterbox): 3 s after each preset change,
+// or always while "always show" is on (hold X + Y, press START).
+extern "C" unsigned re4dc_vi_retrace_count(void);
+static unsigned re4dc_look_osd_until;static bool re4dc_look_osd_always;
+extern "C" void re4dc_look_osd_toggle(void){
+    re4dc_look_osd_always=!re4dc_look_osd_always;re4dc_look_osd_until=re4dc_vi_retrace_count()+180U;
+    re4dc_log("look: label always %s\n",re4dc_look_osd_always?"on":"off");
+}
+extern "C" const char* re4dc_look_osd_text(void){
+    if(!re4dc_look_osd_always && int(re4dc_look_osd_until-re4dc_vi_retrace_count())<=0)return nullptr;
+    return re4dc_looks[re4dc_look_mode%kLooks].text;
+}
+extern "C" void re4dc_look_set(unsigned mode){
+    re4dc_look_mode=mode%kLooks;re4dc_look_applied=true;re4dc_look_osd_until=re4dc_vi_retrace_count()+180U;
+    const Re4dcLook& lk=re4dc_looks[re4dc_look_mode];
+#if defined(RE4DC_EFFECT_PS2_TOGGLE) && RE4DC_EFFECT_PS2_TOGGLE
+    re4dc_ps2fx_set(lk.fx); // masked to the built features
+#endif
+#if defined(RE4DC_CHARBAKE_TOGGLE) && RE4DC_CHARBAKE_TOGGLE
+    if(re4dc_look_chr(re4dc_look_mode)!=re4dc_look_chr_last){
+        re4dc_look_chr_last=re4dc_look_chr(re4dc_look_mode);re4dc_charbake_set(re4dc_look_chr_last);
+    }
+#endif
+    if(re4dc_look_scaler_boot==~0U)re4dc_look_scaler_boot=PVR_GET(PVR_SCALER_CFG);
+    const unsigned vs=lk.soft==1?1025U:lk.soft==2?1024U:(re4dc_look_scaler_boot&0xffffU);
+    const char* how=re4dc_look_scaler_request((re4dc_look_scaler_boot&~0xffffU)|vs);
+    re4dc_log("look: preset %u %s (curve %u cap %u fog colour %u%% sky %u fx %u grade %u vscale %u scaler %08x %s)\n",re4dc_look_mode,lk.label,
+        lk.curve,lk.cap,lk.rgb,lk.sky,lk.fx,lk.grade,vs,unsigned(PVR_GET(PVR_SCALER_CFG)),how);
+}
+// GM / GA: the r100 outdoor cuts (fog colour 8d8775 with a negative fog start: cuts 0-3, 5-9, 12-15; the house
+// cuts 4 / 10 / 11 start at 9.8 m and match the GameCube already) get one full-screen multiply. Per channel
+// GameCube / Dreamcast mean over the r100 start + path stills (GD preset): r 0.87, g 0.89, b 0.845.
+static unsigned re4dc_look_grade_rgb_now;
+extern "C" unsigned re4dc_look_grade_argb(void){
+    if(!re4dc_look_applied)re4dc_look_set(re4dc_look_mode); // the first frame applies preset 0's effect look + scaler
+    return re4dc_looks[re4dc_look_mode%kLooks].grade?re4dc_look_grade_rgb_now:0U;
+}
+extern "C" void re4dc_look_cycle(void){re4dc_look_set(re4dc_look_mode+1);}
+extern "C" const char* re4dc_look_label(void){return re4dc_looks[re4dc_look_mode%kLooks].label;}
+static inline unsigned re4dc_look_curve(){return re4dc_looks[re4dc_look_mode%kLooks].curve;}
+static inline unsigned re4dc_look_cap(){return re4dc_looks[re4dc_look_mode%kLooks].cap;}
+static inline unsigned re4dc_look_rgb_pct(){return re4dc_looks[re4dc_look_mode%kLooks].rgb;}
+static inline unsigned re4dc_look_sky(){return re4dc_looks[re4dc_look_mode%kLooks].sky;}
+#define RE4DC_SKY_ANY 1
+static inline unsigned re4dc_sky_mode(){return re4dc_look_sky();}
+#elif RE4DC_LOOK_ANY
+#ifndef RE4DC_FOG_CURVE
+#define RE4DC_FOG_CURVE 0
+#endif
+#ifndef RE4DC_FOG_CAP
+#define RE4DC_FOG_CAP 100
+#endif
+#ifndef RE4DC_FOG_RGB_PCT
+#define RE4DC_FOG_RGB_PCT 100
+#endif
+static inline unsigned re4dc_look_curve(){return RE4DC_FOG_CURVE;}
+static inline unsigned re4dc_look_cap(){return RE4DC_FOG_CAP;}
+static inline unsigned re4dc_look_rgb_pct(){return RE4DC_FOG_RGB_PCT;}
+#endif
+#ifndef RE4DC_SKY_ANY
+#if defined(RE4DC_SKY_FAR)
+#define RE4DC_SKY_ANY 1
+static inline unsigned re4dc_sky_mode(){return RE4DC_SKY_FAR;}
+#else
+#define RE4DC_SKY_ANY 0
+#endif
+#endif
 // D367 frontend30 (obj/frontend30.h; all default off = previous image).
 // COPY_LEAN: no zero-fill of clip scratch written before it is read, one
 // XMTRX load per mesh part, and no lighting snapshot for deferred parts that
@@ -2081,6 +2228,27 @@ extern "C" void re4dc_fog_capture(int type,float start,float end,unsigned rgba){
     fog_now.type=type;fog_now.start=start;fog_now.end=end;fog_now.rgba=rgba;
 }
 extern "C" unsigned re4dc_fog_enabled(){return fog_now.type!=0;}
+#if defined(RE4DC_WATER45_NATIVE) && RE4DC_WATER45_NATIVE
+// WATER45_NATIVE (espgen45.cpp): the fog amount re4dc_fog_frame's table gives eye depth z (GX curve + far ramp).
+// The table this frame's PVR fog holds (fog_loaded): effects switch the source fog off around their own draws.
+extern "C" float re4dc_fog_amount(float z){
+    if(fog_loaded.type<=0)return 0.0f;
+    const float far=fog_loaded.far>1.0f?fog_loaded.far:(fog_loaded.end>1.0f?fog_loaded.end:1.0f);
+    float f=gx_fog(fog_loaded.type,fog_loaded.start,fog_loaded.end,z);
+    const float ramp=(z-kFogRamp*far)/((1.0f-kFogRamp)*far);
+#if RE4DC_LOOK_ANY
+    if(ramp>0){
+        const unsigned curve=re4dc_look_curve();const float cap=float(re4dc_look_cap())/100.0f;
+        const float s=ramp>=1?1.0f:ramp*ramp*(3.0f-2.0f*ramp);
+        if(!curve)f+=(1.0f-f)*s;
+        else if(curve==2 && f<cap*s)f=cap*s;
+    }
+#else
+    if(ramp>0){const float s=ramp>=1?1.0f:ramp*ramp*(3.0f-2.0f*ramp);f+=(1.0f-f)*s;}
+#endif
+    return f;
+}
+#endif
 #if RE4DC_ACTOR_FOG_GATE
 // ACTOR_FOG_GATE: the fogged source View far last noted (re4dc_fog_note_far, already clamped to
 // FOG_FAR), the value re4dc_fog_far_for_gate gives SCENERY_GATE for the same View; 0 when unknown.
@@ -2133,6 +2301,43 @@ extern "C" void re4dc_fog_frame(){
 #endif
      }}
 #endif
+#if RE4DC_LOOK_ANY
+#if defined(RE4DC_LOOK_TOGGLE)
+    re4dc_look_grade_rgb_now=(fog_now.type && (fog_now.rgba>>8)==0x8d8775U && fog_now.start<1000.0f)?0xffdee3d7U:0U;
+#endif
+    if(!fog_now.type)return;
+    // Look knobs (post30.mk, look study 2026-10-10): FOG_CURVE / FOG_CAP / FOG_RGB_PCT, or LOOK_TOGGLE's preset.
+    const unsigned curve=re4dc_look_curve(),rgb_pct=re4dc_look_rgb_pct();const float cap=float(re4dc_look_cap())/100.0f;
+    static unsigned look_loaded=~0U;
+    const unsigned look_key=curve|rgb_pct<<4|unsigned(re4dc_look_cap())<<12;
+    if(look_key==look_loaded && fog_now.type==fog_loaded.type && fog_now.start==fog_loaded.start &&
+       fog_now.end==fog_loaded.end && fog_now.far==fog_loaded.far && fog_now.rgba==fog_loaded.rgba)return;
+    look_loaded=look_key;
+    fog_loaded=fog_now;
+    const float far=fog_now.far>1.0f?fog_now.far:(fog_now.end>1.0f?fog_now.end:1.0f);
+    const float rgb_k=float(rgb_pct)/100.0f; // FOG_RGB_PCT: the fog colour, and so the background, scaled down
+    const float r=float((fog_now.rgba>>24)&255U)/255.0f*rgb_k,g=float((fog_now.rgba>>16)&255U)/255.0f*rgb_k,
+                b=float((fog_now.rgba>>8)&255U)/255.0f*rgb_k;
+    float table[129];
+    // FOG_CURVE: the table spans the source fog curve out to its end (the GameCube's GXSetFog), not the cull far;
+    // =2 adds a ramp to FOG_CAP % at the cull far. 0: the 100 % ramp over the last 20 % before the cull far.
+    const float tfar=curve && fog_now.end>far?fog_now.end:far;
+    for(unsigned j=0;j<129;++j){
+        const float v=j<128?float((j&15U)+16U)/16.0f*float(1U<<(j>>4)):256.0f;
+        const float z=tfar/v;
+        float f=gx_fog(fog_now.type,fog_now.start,fog_now.end,z);
+        const float ramp=(z-kFogRamp*far)/((1.0f-kFogRamp)*far);
+        if(ramp>0){
+            const float s=ramp>=1?1.0f:ramp*ramp*(3.0f-2.0f*ramp);
+            if(!curve)f+=(1.0f-f)*s;
+            else if(curve==2 && f<cap*s)f=cap*s;
+        }
+        table[j]=f;
+    }
+    pvr_fog_table_color(1.0f,r,g,b);
+    pvr_fog_far_depth(tfar);
+    pvr_fog_table_custom(table);
+#else
     if(!fog_now.type)return;
     if(fog_now.type==fog_loaded.type && fog_now.start==fog_loaded.start && fog_now.end==fog_loaded.end &&
        fog_now.far==fog_loaded.far && fog_now.rgba==fog_loaded.rgba)return;
@@ -2152,6 +2357,7 @@ extern "C" void re4dc_fog_frame(){
     pvr_fog_table_color(1.0f,r,g,b);
     pvr_fog_far_depth(far);
     pvr_fog_table_custom(table);
+#endif
 #if RE4DC_FOG_BACKGROUND
 #if defined(RE4DC_SS_BG_BLACK) && RE4DC_SS_BG_BLACK
     ss_bg_rgb[0]=r;ss_bg_rgb[1]=g;ss_bg_rgb[2]=b;ss_bg_rgb_set=1;
@@ -2972,15 +3178,36 @@ bool ps2_open(){
     return true;
 }
 // 1 complete, 0 a part fell back (not drawn) or the camera is unusable, -1 aborted after publishing.
+#if RE4DC_SKY_ANY
+// SKY_FAR (post30.mk, look study 2026-10-10): the PS2 world rows (R4PW placement field = OBJ group = SMD row) that
+// hold the room's sky dome and backdrop cards, from the PS2 OBJ exports (TYPE_08 / SMX 029 rows reaching 25-56 m up
+// and 60-240 m out). r100: BIN 127 / 128 / 126 (rows 2, 3, 75) and the SMX 029 treeline cards (rows 33..37);
+// r101: the cloud dome BIN 1 (row 0) and the treeline BIN 2 / 7 (rows 1, 2).
+static bool ps2_sky_row(unsigned room,unsigned row){
+    if(room==0x100)return row==2 || row==3 || row==75 || (row>=33 && row<=37);
+    if(room==0x101)return row<=2;
+    return false;
+}
+} // namespace
+extern "C" { unsigned re4dc_ps2_sky_header; } // native_ui.cpp: 1 = the next PS2 world header has its fog off
+namespace {
+#endif
 int ps2_pass(unsigned pass,float zfar){
     auto& c=ps2w.count[pass];c={};
+#if RE4DC_SKY_ANY
+    re4dc_ps2_sky_header=0;
+#endif
     const float* P=ps2w.projection;
     if(P[0]!=0 || ps2w.viewport[2]<=0 || ps2w.viewport[3]<=0)return 0;
     const float near=P[6]/(P[5]-1),far=P[6]/P[5];
     if(!re4dc::render::is_finite(near)||!re4dc::render::is_finite(far)||near<=0||far<=near)return 0;
     float cull_far=far;
     if(zfar>near && zfar<cull_far)cull_far=zfar;
+#ifdef RE4DC_FAR_CAP
+    if(cull_far>float(RE4DC_FAR_CAP))cull_far=float(RE4DC_FAR_CAP); // FOG_FAR_CAP (post30.mk): follows FOG_FAR
+#else
     if(cull_far>25000.0f)cull_far=25000.0f; // native_ps2_world.cpp's far
+#endif
 #if RE4DC_NATIVE_FOG
     if(fog_now.far>near && fog_now.far<cull_far)cull_far=fog_now.far; // hidden by the fog ramp
 #endif
@@ -2991,6 +3218,9 @@ int ps2_pass(unsigned pass,float zfar){
     if(pass){const float f=foliage_far;if(f>near && f<cull_far)cull_far=f;}
 #endif
     c.near=near;c.far=far;c.cull_far=cull_far;
+#if RE4DC_SKY_ANY
+    const float pass_cull_far=cull_far;
+#endif
 #if RE4DC_PS2_WORLD_DYNAMIC
     if(!pass && dyn::ids){
         const unsigned f=re4dc_ui_frame();
@@ -3122,6 +3352,13 @@ int ps2_pass(unsigned pass,float zfar){
 #endif
         const re4dc::render::DrawBounds bounds{{mesh.bounds_min[0],mesh.bounds_min[1],mesh.bounds_min[2]},
                                                {mesh.bounds_max[0],mesh.bounds_max[1],mesh.bounds_max[2]}};
+#if RE4DC_SKY_ANY
+        // SKY_FAR (post30.mk, look study): the room's sky / backdrop rows draw to the projection far.
+        const unsigned sky_mode=re4dc_sky_mode();
+        const bool sky=sky_mode && ps2_sky_row(ps2w.room,pl.placement);
+        const float cull_far=sky?far:pass_cull_far;
+        re4dc_ps2_sky_header=(sky_mode==2 && sky)?1U:0U;
+#endif
         if(!re4dc::render::group_visible(bounds,mv,P,ps2w.viewport,near,cull_far,0)){++c.culled;continue;}
         const float grid[12]={mesh.step[0],0,0,mesh.origin[0], 0,mesh.step[1],0,mesh.origin[1], 0,0,mesh.step[2],mesh.origin[2]};
 #if RE4DC_PS2_INTERIOR_CULL
@@ -3237,6 +3474,9 @@ int ps2_pass(unsigned pass,float zfar){
         } else pcact::unchecked+=pcact::nbox;
         pcact::nbox=0;
     }
+#endif
+#if RE4DC_SKY_ANY
+    re4dc_ps2_sky_header=0;
 #endif
     return c.fallback?0:1;
 }

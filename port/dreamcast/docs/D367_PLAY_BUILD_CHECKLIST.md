@@ -1,4 +1,171 @@
-# D367 play build checklist (user, 2026-09-29)
+# D367 play build checklist (user, 2026-10-09 current state at top)
+
+## 2026-10-10: r117 (ROUTE_CH21 discs)
+
+Stage the following:
+- st1/r117.arc, plus st1/r117.dar and the merged banks (aica_banks with ROOMS r117).
+- em/pl11.drs and em/em11.drs. em11 must be **prepared**: prepare_enemy_motions, with its dc/mot keys.
+- dc/pl11.ovl from the same build.
+- dc/native/r117/{MAINSCENARIO.re4mesh, ps2-world.r4pw, ps2-world.re4mesh, ps2-world.ids}.
+- dc/movie/r117s00.seq and r117s10.seq.
+- The r117 / pl11 / em11 textures and the five material pairs.
+- The VQ chapter 2-1 end backdrops b5abaf9b-5f0d7500, c69c425c-2a504ae2 and 6ad8a6c4-60365df4, **inside dc/tex.pak**
+  (a pack entry wins over a loose file).
+
+No new flag. ROUTE_CH21 now reads up to 32 aica_str entries, so the r11b / r118 streams play.
+Check:
+- r118 door 4 enters r117.
+- Ashley's door plays s00 then s10.
+- "End of Chapter 2-1" shows both backdrops and "Save?".
+- A revisit spawns the two em11 Ganados with no "Memory allocate failed".
+
+## 2026-10-10: r118 (ROUTE_CH21 discs)
+
+Stage st1/r118.arc, st1/r118.dar + bgm/bio4midi.dat (aica_banks with ROOMS r118), bgm/aica_str.dat with streams
+1:148 and 0:23, dc/native/r118/{MAINSCENARIO.re4mesh, ps2-world.r4pw, ps2-world.re4mesh, ps2-world.ids}, the r118
+textures and material pairs 4605d017-2d97db21 + b34e217d-8dfb0009 merged into dc/tex.pak with the catalog pack.
+Check: r119 door 0 enters r118 (music #11), its r117 door says "Coming Soon".
+
+## 2026-10-10: ACTOR_EXACT_FAST (ROUTE_CH21 block)
+
+No new flag or staged file: ROUTE_CH21=1 brings ACTOR_EXACT_FAST=1 (faster exact actor lighting). Check: r119 trees
+lit by the torches as before.
+
+## 2026-10-10: LINK_TIGHT, LINK_OVL_HELPERS, MOVIE_FENCE_RETRY (ROUTE_CH21 block)
+
+No new flag or staged file: ROUTE_CH21=1 now links without the KOS .sub padding, moves single-overlay helpers into
+dc/pl0f / em2f / em2b .ovl (stage the overlays from the same build: they grew), and retries a not-ready movie fence.
+Check: build.log prints "ovl_helpers: 31 sections"; s30 heap_before >= 57,504.
+
+## 2026-10-10: WATER45_NATIVE (r10b lake water, play recipe)
+
+No new flag: ROUTE_CH13=1 now also brings **WATER45_NATIVE=1** (the lake surface drawn natively, the PS2's r10b
+sprite set). No new staged file. Check: r10b dock and boat views show dark water, no pale sheet (route doc "r10b lake water").
+
+## 2026-10-10: stream 1:148 (the r11b radio call voice) in bgm/aica_str.dat
+
+Stage **bgm/aica_str.dat built with `aica_banks.py streams --mirror <LE mirror with the .sbb> --out DIR --streams
+ch21`** (16,504,832 B, sha256 c49229aa..; lane r11b rooms/str-r11b-ch21, staged by lane r11b mkfix r11b()): the r11b
+14-stream file plus 1:148 appended (earlier entries byte-identical after the header). Check: on r11b entry `stream
+1:148 start` after 1:3, no "sbb=9900000 not in aica_str.dat". Still silent, not covered: 0:29 on the chapter 1-3
+results screen (route doc "stream 1:148").
+
+## 2026-10-10: material pair 18d0fd82-2c9a9309 (r10b / r11b, disc data)
+
+Add **dc/tex/1/18d0fd82-2c9a9309.re4tex** (/root/probe/lanes/route/pairs-r11b, VQ, 18,576 B) to the texture set
+that goes into the pack: lane r11b tools/mkfix.py r11b() now does (r11b / r11a discs); a chapter 1-3-only disc needs
+it too (r10b opens it after s00). Rebuild: `tools/d367/pairs_from_log.py --iso <GC disc 1> --file st1/r11b.das --log
+<run log with its "pair missing" line> --output DIR`, then vq_native_ui.py --model-min-bytes 16384 (route doc "material
+pair 18d0fd82"). pack-fixture.sh packs only the staged loose dc/tex files and its output replaces the fixture's
+existing dc/tex.pak: merge the catalog pack (d87983e1) in first. Check: no `open failed` for 18d0fd82 in r10b / r11b.
+
+## 2026-10-10: WATER42_GRID_SKIP (r10a / r11a lake water, play recipe)
+
+No new flag: ROUTE_CH13=1 now also brings **WATER42_GRID_SKIP=1** (espgen42 keeps only its water plane; the height
+grid and its per-frame update are gone; init RNG draws kept). No disc change. r11a quiet 58.8 -> 41.2 hw ms of work
+(Flycast 22 -> 30 fps), Ganados 68.1 -> 49.3; heap 4 +1.1 MB in r11a, +1.0 MB in r10a. `WATER42_GRID_SKIP=0` restores
+the grid. Gates: docs/lanes/route.md "WATER42_GRID_SKIP".
+
+## 2026-10-10: next TEST build adds PVR_READY_STRICT=1 PVR_LATCH=1 (issue 9; not the play recipe yet)
+
+For the next console test disc (the r108 -> r109 bridge door hang, issue 9) add **PVR_READY_STRICT=1 PVR_LATCH=1**
+to the route-build.sh play flags (both need CRASH_SCREEN=1 and PVR_PIPELINE=2, already in the recipe). They go into
+the default play recipe only after a console confirms. No disc change.
+- PVR_READY_STRICT (default 0; knob-off image byte-identical apart from the time stamp): KOS's
+  pvr_start_ta_rendering() ignores pvr_wait_ready()'s 100 ms timeout and writes the next scene into the TA bank whose
+  previous scene was never handed to a render (and, with one bank, into the bank being rendered). Link wraps of
+  pvr_list_begin / pvr_set_presort_mode keep waiting in 100 ms slices (bounded at 10 s, then the stop screen names
+  the wait); present_fence keeps waiting for pvr_present_wait the same way instead of stopping after one 100 ms
+  wait. platform/native_ui.cpp namespace pvr_ready documents every PVR wait that was checked.
+- With PVR_LATCH the stop screen gets a row `rdy K<n> Q<n> Y<n> first <ui frame> last <ui frame>` (expired slices:
+  K TA bank, Q render done, Y present fence; `rdy K0 Q0 Y0` = the path never fired) and the event ring the codes
+  K / Q / Y. Test aid: dc/crashtest.txt `pvrwait` (never on a play disc) forces three K slices and the stop screen.
+- Gates (D:/Flycast-Evidence/re4-dreamcast/kosfix-20261010): see docs/lanes/route.md "PVR_READY_STRICT".
+
+## 2026-10-10: SBB_STUB=1, the GC stream banks leave the disc (play recipe)
+
+Play ELF: add **SBB_STUB=1** to the route-build.sh flags below (r11b / r10b recipes). Disc: **remove
+bgm/bio4bgm.sbb (139,395,072 B) and bgm/bio4evt.sbb (193,495,040 B)**: 332,890,112 B (162,544 sectors) leave
+track 3; no new file is staged (keep bgm/bio4str.hed and bgm/aica_str.dat). Why it is safe: the recovered stream
+player (src/game/snd_str*.cpp) only opens the banks (DVDOpen in Snd_str_init; SndStrReq refuses a stream whose
+FileTbl entry is -1). Its headers (lengths, loop points, rates, the .sbb offsets aica_str.dat is keyed by) come from
+bio4str.hed; its only reads of the banks are the wrapped, skipped ones (platform/audio_strm.cpp
+__wrap_DVDReadAsyncPrio, every build since the AICA work); the heard audio is aica_str.dat. With the knob,
+platform/dvd.cpp gives both FileTbl entries their retail size without opening them, so entry numbers,
+DVDFileInfo.length and every stream state are unchanged. A knob-off ELF needs the banks on the disc (every stream
+request would fail "SND: File Not Found"). aica_banks.py still reads the banks from the source mirror
+(/root/re4data), never from a staged disc. io_probe.cpp (IO_PROBE builds) still names them: not for play discs.
+Gates (lane sbb, evidence D:/Flycast-Evidence/re4-dreamcast/sbb-20261010): see docs/lanes/route.md "SBB_STUB".
+
+## 2026-10-10: r119 (El Gigante, after r11a) staging recipe (not built, not released)
+
+The r11a recipe with ROUTE_CH21=1 SBB_STUB=1; the build writes a fifth overlay, **em2b.ovl: stage dc/em2b.ovl**.
+Add (lane r119 tools/mkfix.py `base`): st1/r119.arc (released) + st1/r119.dar (aica-r119), **em/em2b.drs = the
+prepared archive** (prepare_enemy_motions --textures tex-em2b, then aica_banks; the GC body does not fit heap 4) and
+its 89 motion keys dc/mot/*.fcv, bgm/aica_str.dat with stream 0:5, dc/native/r119/{MAINSCENARIO.re4mesh,
+ps2-world.r4pw/.re4mesh/.ids}, dc/movie/r119s00/s10/s20/s30.seq, and the r119 / em2b / PS2 world textures (VQ
+overlays first) plus pair 41387140-38190dc7 (into the pack). Checks: r11a door 0 -> r119, the four movies, the
+giant textured, door 0 / 6 "Coming Soon", door 1 -> r11a.
+
+## 2026-10-10: r11a (chapter 2-1, after r11b) staging recipe (not built, not released)
+
+The r11b recipe below with SBB_STUB=1; no new build flag (ROUTE_CH21=1 covers r11a). Add (lane r11a tools/mkfix.py
+`base`): st1/r11a.arc (released) + st1/r11a.dar (aica-r11a: ROOM / FOOT / em12 / em24 prebuilt),
+dc/native/r11a/{MAINSCENARIO.re4mesh, ps2-world.r4pw/.re4mesh/.ids}, and the r11a + r11a PS2 world textures (into
+the pack). em12 / em24 .drs, bio4midi.dat and aica_str.dat stay as r11b's. Disc +11.3 MB. Checks: r11b door 0 ->
+r11a, r11a door 0 -> "Coming Soon" (r119), door 1 -> r11b, the Ganados at the r119 door.
+
+## 2026-10-10: r11b (chapter 2-1's start) staging recipe (not built, not released)
+
+The r10b recipe below plus ROUTE_CH21=1 on the play ELF; the build writes a fourth overlay, **em22.ovl: stage
+dc/em22.ovl** with dc/pl0f.ovl + dc/em2f.ovl. Add (lane r11b tools/mkfix.py `base`): **etc/emleon01.esl le_mirror'd**
+(the disc carried the raw GC file; without it R11bInit hangs), st1/r11b.arc + r11b.dar, em/em22.drs (rel-stripped;
+**drop it from the r10b removal list**), bgm/aica_str.dat with streams 0:17 + 1:36 + 1:148 (`--streams ch21`, 16,504,832 B), bgm/bio4midi.dat
+with #10 prebuilt, dc/native/r11b/{MAINSCENARIO.re4mesh, ps2-world.r4pw/.re4mesh/.ids}, dc/movie/r11bs00.seq,
+the r11b + em22 + PS2 world textures and the material pair 18d0fd82 (pairs-r11b) (into the pack). Disc +31.5 MB loose (~42 MB free on track03). Checks: the
+chapter 1-3 save, door 6 into r11b, s00, the radio call, the ambush, the three "Coming Soon" doors.
+With SBB_STUB=1 (section above) also remove bgm/bio4bgm.sbb and bgm/bio4evt.sbb: track03 then has ~343 MB free (~10 MB + 332.9 MB).
+
+## 2026-10-10: r10b (chapter 1-3's end) play disc staging recipe (not built, not released)
+
+Play ELF = route-build.sh with the 2026-10-09 test-build flags plus `PRIM_CAP_R10B=327680` (DBG_WARP=0
+PC_SAMPLER=0 PACE_DEBUG=1 ROUTE_CH13=1 ACT_CAP=0 PS2_INTERIOR_ACTORS=2 GAME_ATLIST_OVERFLOW=1 GAME_ATLIST_512=1
+LEON_NATIVE_PIPE=0 LEON_FACE_LAZY=0 NATIVE_LASER=1 ACTOR_GANADO_SOURCE_LIGHT=0 PRIM_CAP_R10B=327680). ROUTE_CH13=1
+brings ROUTE_OVL=1, WATER45_GRID_SKIP=1 and the em27 slot fix by default. The build writes **three overlays next to
+the ELF: sscrn.ovl, pl0f.ovl, em2f.ovl.** Never stage the warp test aid (r10b-warp-testaid.patch) into a play image.
+
+Disc = the 2026-10-09 test disc contents (631cb271 fixture + tex pak d87983e1 + the audio overlay) plus r10b
+(lane r10b tools/mkfix.py `base`):
+- st1/r10b.arc + r10b.dar, em/pl0f.drs (rel-stripped: le_mirror --compact-static-rel=pl0f), em/em2f.drs,
+  bgm/aica_str.dat with stream 0:4 (the boss), the r10b PS2 world (dc/native/r10b/ps2-world.*), MAINSCENARIO.re4mesh,
+  the six r10b movies (r10bs00/s10/s20/s20c/s21/s22), r10b textures in the pack;
+- **dc/pl0f.ovl and dc/em2f.ovl from the same build** (lane tools/addovl.py adds them to a fixture; stage-scenario.py
+  places only 1ST_READ.BIN and dc/sscrn.ovl itself). Without them entering r10b stops in "route overlay missing";
+- removals (never read by the play route; D:/Flycast-Evidence/re4-dreamcast/r10b-20261009/disc-audit.json): em/em10,
+  em11, em1f, em20, em22, em25, em2b, em2c, em2d .drs; st1/r100, r101, r103, r120 .das; st1/r120.dar + .arc;
+  le_mirror_report.json. Payload 990,220,914 B against the GD's 1,032,499,200 B.
+- no dc/warp.txt, no dc/padscript.txt.
+Checks before the SD card: pack keys and file list against the 10-09 disc (only the r10b files, the overlays and
+1ST_READ.BIN differ; the removals above are gone); boot the real disc in Flycast to the VMU prompt; New Game intros
+1971 / 2360; the r10a -> r10b door, boarding, the QTE, "Coming Soon". The bio4bgm / bio4evt.sbb lever is done:
+SBB_STUB=1 (top section).
+
+## 2026-10-09: test build for issues 9 and 15
+
+Play ELF = route-build.sh with the 631cb271 flags (DBG_WARP=0 PC_SAMPLER=0
+PACE_DEBUG=1 ROUTE_CH13=1 ACT_CAP=0 PS2_INTERIOR_ACTORS=2 GAME_ATLIST_OVERFLOW=1
+GAME_ATLIST_512=1 LEON_NATIVE_PIPE=0 LEON_FACE_LAZY=0 NATIVE_LASER=1
+ACTOR_GANADO_SOURCE_LIGHT=0); built at cc5da41b it reproduces the 631cb271
+image byte for byte. Disc = the 631cb271 qualification fixture
+(reporter-goal-20261008/inventory-world-sort-ram-v2.json, catalog pack d87983e1,
+padscript removed) plus an audio overlay:
+- bgm/aica_str.dat rebuilt with the 631cb271 stream list (index identical);
+- every prebuilt bank refiltered in place:
+  `aica_banks.py reconvert --root <631 disc sound files> --mirror /root/probe/d362-mirror,/root/probe/codex-audio-20261007/mirror --out <overlay>`
+  (each file proved: the box conversion of the mirror source reproduces the old image).
+Payloads must equal the 631cb271 disc manifest except 1ST_READ.BIN, dc/sscrn.ovl,
+bgm/aica_str.dat and the 39 bank files. Any new bank build gets the filter
+automatically (FILTER_VERSION in the cache key). TA_GUARD stays 0.
 
 ## 2026-10-07: native Ganado prelit lighting and missing beam
 

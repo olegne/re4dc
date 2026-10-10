@@ -29,6 +29,11 @@ usage:
   aica_banks.py disc --mirror DIR --out DATADIR --cache DIR [--json OUT]
       (build + streams + merge in one step, both cached by content: what
       tools/d367/stage.sh runs for every disc; banks rewritten, the rest hardlinked)
+  aica_banks.py reconvert --root DISCTREE --mirror DIR[,DIR...] --out OVERLAY [--cache DIR] [--json OUT]
+      (refilter the prebuilt banks of an existing disc tree with decimate_aa, headers and sizes kept)
+
+Prebuilt banks are decimated with an anti-alias filter (decimate_aa, FILTER_VERSION 2); the runtime
+converter for banks that are not prebuilt keeps its box average (decimate mirrors it).
 
 Game data never enters the repository: the mirror, the overlay and the cache are
 private directories.
@@ -96,7 +101,7 @@ LOWER_ORDER = (8, 5, 1, 6, 2, 7, 0, 3)
 # r109). A room's second-slot track (BGM1, 0 bytes in the frozen layout) is replaced at runtime by a resident one
 # (snd.cpp, ROUTE_CH13). Only rooms of the planned route add entries. r104 and r107 both request
 # bank 9; it must also be prebuilt, otherwise runtime conversion exhausts the unreserved AICA bytes.
-ROOM_BGM0 = {'r102': [1], 'r104': [9], 'r107': [9], 'r108': [5], 'r109': [3], 'r10a': [3]}
+ROOM_BGM0 = {'r102': [1], 'r104': [9], 'r107': [9], 'r108': [5], 'r109': [3], 'r10a': [3], 'r10b': [3], 'r11b': [10], 'r11a': [10], 'r119': [3], 'r118': [11], 'r117': [11]}
 
 # Leon's other stage-1 weapons (--weapons; stage.sh AICA_WEAPONS=1; issue lamb2k/re4dc#1, silent weapons). The GC
 # loads the equipped weapon's SE block (WEP, block 2) on every weapon change (weaponLoad -> its .drs) into the one WEP
@@ -127,6 +132,12 @@ ROOMS = {
     'r102': ['st1/r102.dar', 'em/em18.drs'],
     'r108': ['st1/r108.dar', 'em/em17.drs', 'em/em23.drs', 'em/em24.drs'],
     'r10a': ['st1/r10a.dar', 'em/em12.drs', 'em/em24.drs', 'em/em2a.drs'],
+    # r10b (chapter 1-3's end, the lake): the ESL lists pl0f (Leon's boat, entry) / em2f (Del Lago, enabled later);
+    # R10bInit's r10b_setEm sets five em27 fish (EmSetEvent). bgmtbl: slot 0 = bio4midi #3 (as r109 / r10a), no slot 1.
+    'r10b': ['st1/r10b.dar', 'em/pl0f.drs', 'em/em2f.drs', 'em/em27.drs'],
+    # r11b (chapter 2-1's start, the lake shore): pl0f (the boat, entry), em22 (the shore wolves, script spawn), em27
+    # (the fish, entry). bgmtbl: both slots bio4midi #10 (as r10c / r11a), stream 0:17 (the battle stream).
+    'r11b': ['st1/r11b.dar', 'em/pl0f.drs', 'em/em22.drs', 'em/em27.drs'],
     # r210 (St2, world coverage lane): no enemy archive (assets.sh discover r210: lists emleon03/04, no entries)
     'r210': ['st2/r210.dar'],
     # r40c (St4, world coverage lane): no enemy archive (discover r40c: omake00.esl, no entries)
@@ -139,7 +150,21 @@ ROOMS = {
     'r109': ['st1/r109.dar', 'em/em23.drs'],
     'r10c': ['st1/r10c.dar', 'em/em12.drs'],
     'r10f': ['st1/r10f.dar', 'em/em13.drs'],
-    'r11a': ['st1/r11a.dar', 'em/em12.drs'],
+    # r11a (route lane r11a, chapter 2-1): em24 is also read at room entry, as in r108 / r10a (route-r11a-x1a:
+    # "blk 9 (34040 bytes) does not fit the room arena"). bgmtbl: bio4midi #10 (as r11b).
+    'r11a': ['st1/r11a.dar', 'em/em12.drs', 'em/em24.drs'],
+    # r119 (route lane r119, El Gigante): em2b (the giant, script spawn, rel-stripped) and em21 (the dog that helps, set
+    # by the dog event). bgmtbl: slot 0 = bio4midi #3 (as r109 / r10a / r10b), stream 0:5 (the giant battle).
+    'r119': ['st1/r119.dar', 'em/em2b.drs', 'em/em21.drs'],
+    # r118 (route lane r118, the church, entered from r119 door 0 before Ashley is rescued): em22 (ESL entry 0x78
+    # type, loaded at room entry; the dog spawns only after the rescue). em17 / em3b are enabled later (the after-rescue
+    # Ganados; not on this route). bgmtbl: slot 0 = bio4midi #11, slot 1 = #9 (snd.cpp plays slot 1's requests on the
+    # resident slot-0 track, as r108 / r10a), stream 0:0x17.
+    'r118': ['st1/r118.dar', 'em/em22.drs'],
+    # r117 (route lane r117, the church interior, chapter 2-1's end): pl11 (Ashley, enemy module 3: R117Init reads her
+    # archive, SubCharInit after the s00 event) and em11 (the Ganados R117Init sets on a later visit, Part 0).
+    # bgmtbl: slot 0 = bio4midi #11 (as r118) in both entries (0 and the post-s10 entry 1), no slot 1, no stream.
+    'r117': ['st1/r117.dar', 'em/pl11.drs', 'em/em11.drs'],
     # r40b (St4, follow-up 7): em1f (bringup inventory: em1f/em1f, st4_0)
     'r40b': ['st4/r40b.dar', 'em/em1f.drs'],
 }
@@ -295,6 +320,129 @@ def decimate(x, sh):
     return out
 
 
+# Anti-alias decimation for PREBUILT banks (issue lamb2k/re4dc#15 follow-up). decimate() above mirrors the runtime
+# converter (platform/audio_aica.cpp, banks that are not prebuilt): a box average of 2^sh neighbours, whose first
+# sidelobe is only ~13 dB down, so everything between the new Nyquist and the source band folds back as grainy
+# aliasing. decimate_aa() low-passes at the INPUT rate with a Kaiser-windowed sinc (cutoff 0.45 x the output rate,
+# stopband from 0.5 x the output rate, ~72 dB) and keeps every 2^sh-th filtered value. Same output count as
+# decimate() ((len + n - 1) >> sh), same centre (input k*n + (n - 1)/2, the box's centre), so lengths, loop points,
+# bank sizes, slots and the planner's results are unchanged; only the PCM differs. Values are rounded and clamped to
+# s16. Outside a loop the signal is zero before the first and after the last sample (a one-shot starts and ends in
+# silence). Loop seam: outputs whose input centre lies in the loop body [ls, le) read the body circularly (index
+# ls + (i - ls) mod (le - ls)), so the samples on both sides of the jump are filtered as one continuous periodic
+# signal and the seam stays click-free on every pass. The intro -> loop transition (played once) keeps its linear
+# neighbourhood. Loops come from the wavetable regions (sample_loops); a sample no region loops is filtered as a
+# one-shot. FILTER_VERSION is part of the bank cache key (cached_convert).
+FILTER_VERSION = 2          # 1 = box average (decimate), 2 = Kaiser sinc (decimate_aa)
+AA_CUTOFF = 0.45            # x output rate
+AA_HALF = 24                # half width in output samples (taps = ~48 x 2^sh + 2^sh at the input rate)
+AA_BETA = 6.98              # Kaiser beta for ~72 dB stopband attenuation
+_AA_KERNELS = {}
+
+
+def _bessel_i0(x):
+    s, t, k = 1.0, 1.0, 1
+    while t > 1e-12 * s:
+        t *= (x / (2.0 * k)) ** 2
+        s += t
+        k += 1
+    return s
+
+
+def aa_kernel(sh):
+    """(first relative input offset, taps) of the decimate_aa filter for 2^sh."""
+    if sh in _AA_KERNELS:
+        return _AA_KERNELS[sh]
+    import math
+    n = 1 << sh
+    c0 = (n - 1) / 2.0
+    w = float(AA_HALF * n)
+    fc = AA_CUTOFF / n                          # cycles per input sample
+    r0 = int(math.floor(c0 - w)) + 1
+    r1 = int(math.ceil(c0 + w)) - 1
+    i0b = _bessel_i0(AA_BETA)
+    taps = []
+    for r in range(r0, r1 + 1):
+        t = r - c0
+        x = 2.0 * fc * t
+        sinc = 1.0 if x == 0 else math.sin(math.pi * x) / (math.pi * x)
+        u = t / w
+        win = _bessel_i0(AA_BETA * math.sqrt(max(0.0, 1.0 - u * u))) / i0b
+        taps.append(2.0 * fc * sinc * win)
+    g = sum(taps)
+    taps = [v / g for v in taps]                # unity DC gain
+    _AA_KERNELS[sh] = (r0, taps)
+    return _AA_KERNELS[sh]
+
+
+def decimate_aa(x, sh, loop=None):
+    """Anti-aliased decimation by 2^sh; loop = (start, end) in input samples or None. See the comment above."""
+    if sh == 0:
+        return list(x)
+    import operator
+    mul = operator.mul
+    n = 1 << sh
+    ln = len(x)
+    cnt = (ln + n - 1) >> sh
+    r0, taps = aa_kernel(sh)
+    nt = len(taps)
+    pad = nt + n
+    xp = [0] * pad + list(x) + [0] * pad
+    out = [0] * cnt
+
+    def emit(k, buf, start):
+        v = sum(map(mul, taps, buf[start:start + nt]))
+        v = int(v + 0.5) if v >= 0 else -int(-v + 0.5)
+        out[k] = 32767 if v > 32767 else (-32768 if v < -32768 else v)
+
+    k_lo, k_hi = cnt, cnt
+    if loop:
+        ls, le = loop
+        le = min(le, ln)
+        if 0 <= ls < le:
+            # outputs whose centre k*n + (n-1)/2 lies in [ls, le)
+            k_lo = max(0, (2 * ls - (n - 1) + 2 * n - 1) // (2 * n))
+            k_hi = min(cnt, (2 * le - (n - 1) + 2 * n - 1) // (2 * n))
+            if k_lo < k_hi:
+                period = le - ls
+                base = k_lo * n + r0             # first input index any loop output reads
+                span = (k_hi - 1) * n + r0 + nt - base
+                ring = [x[ls + (i - ls) % period] for i in range(base, base + span)]
+                for k in range(k_lo, k_hi):
+                    emit(k, ring, k * n + r0 - base)
+            else:
+                k_lo = k_hi = cnt
+    for k in range(cnt):
+        if k_lo <= k < k_hi:
+            continue
+        emit(k, xp, k * n + r0 + pad)
+    return out
+
+
+def sample_loops(d, t, mo, ms, nsamples):
+    """{sample index: (loop start, loop end)} from the wavetable regions (WTREGION: loopStart, loopLength,
+    sampleIndex), as audio_aica.cpp plays them (n.lsa = loopStart >> sh, n.len = (loopStart + loopLength) >> sh).
+    The first looped region of a sample wins (regions sharing a sample carry the same loop)."""
+    m = d[mo:mo + ms]
+    base = 0 if t in (3, 4) else struct.unpack_from('<I', m, 0)[0]
+    num, dls, sit, seq = struct.unpack_from('<4I', m, base)
+    wt = base + dls
+    offs = struct.unpack_from('<6I', m, wt)
+    rgn = offs[2]
+    later = [o for o in offs[1:] if o > rgn]
+    if not rgn or not later:
+        return {}
+    out = {}
+    for i in range((min(later) - rgn) // 24):
+        p = wt + rgn + 24 * i
+        if p + 24 > len(m):
+            break
+        unity, kg, fine, attn, lstart, llen, art, sidx = struct.unpack_from('<BBhiIIII', m, p)
+        if llen and sidx < nsamples and sidx not in out:
+            out[sidx] = (lstart, lstart + llen)
+    return out
+
+
 SCALE = (230, 230, 230, 230, 307, 409, 512, 614)
 
 
@@ -356,14 +504,16 @@ def energies(ref, got):
     return sum(v * v for v in ref), sum((a - b) ** 2 for a, b in zip(ref, got))
 
 
-def convert_block(img, samples, coefs, cap, check=False):
+def convert_block(img, samples, coefs, cap, check=False, loops=None, filt=FILTER_VERSION):
     """AICA image (bytes) and, when `check`, the bank SNR (signal energy over ADPCM
-    error energy, all samples, dB) after decoding the image back."""
+    error energy, all samples, dB) after decoding the image back. filt 2 (default):
+    decimate_aa with `loops` ({sample index: (start, end)}); filt 1: the runtime's box."""
     import math
     parts, sig, err = [], 0, 0
-    for (fmt, rate, offset, length, ai) in samples:
+    for si, (fmt, rate, offset, length, ai) in enumerate(samples):
         sh = sample_shift(rate, length, cap)
-        pcm = decimate(dsp_decode(img, offset, length, coefs[ai], None), sh)
+        src = dsp_decode(img, offset, length, coefs[ai], None)
+        pcm = decimate_aa(src, sh, (loops or {}).get(si)) if filt >= 2 else decimate(src, sh)
         enc = yamaha_encode(pcm)
         need = sample_bytes(length, sh)
         enc = enc[:need] + bytes(need - min(need, len(enc)))
@@ -548,7 +698,8 @@ def build(mirror, out, res, per_room, uniq, slots, cache_dir, check, weapons=())
                 if key not in by_key or not samples:
                     continue
                 b = by_key[key]
-                img, worst = cached_convert(cache_dir, bytes(d[ao:ao + asz]), samples, coefs, b.cap, check)
+                loops = sample_loops(bytes(d), t, mo, ms, len(samples))
+                img, worst = cached_convert(cache_dir, bytes(d[ao:ao + asz]), samples, coefs, b.cap, check, loops)
                 assert len(img) == b.size, (b.name, len(img), b.size)
                 lay = [slots.get(i, 0) for i in range(9)]
                 hdr = HDR.pack(MAGIC, VERSION, b.cap, len(img), len(samples), key[0], asz, slot_of(t), 0, *lay, *([0] * 7))
@@ -569,14 +720,20 @@ def build(mirror, out, res, per_room, uniq, slots, cache_dir, check, weapons=())
     return written
 
 
-def cached_convert(cache_dir, img, samples, coefs, cap, check):
+def cached_convert(cache_dir, img, samples, coefs, cap, check, loops=None, filt=FILTER_VERSION):
+    # The filter version and the loops are part of the key: a cache filled by the box filter (keys without them)
+    # is never reused for a filtered bank. The bank header keeps VERSION 1 (audio_aica.cpp rejects any other
+    # version and the image layout is unchanged).
     if cache_dir:
-        h = hashlib.sha256(img + struct.pack('<I', cap) + repr(samples).encode()).hexdigest()
+        key = img + struct.pack('<I', cap) + repr(samples).encode()
+        if filt >= 2:
+            key += b' filter %d %r %r %r %r' % (filt, AA_CUTOFF, AA_HALF, AA_BETA, sorted((loops or {}).items()))
+        h = hashlib.sha256(key).hexdigest()
         p = os.path.join(cache_dir, h + ('.chk2' if check else '') + '.aic')
         if os.path.exists(p):
             blob = open(p, 'rb').read()
             return blob[8:], struct.unpack_from('<d', blob, 0)[0]
-    out, worst = convert_block(img, samples, coefs, cap, check)
+    out, worst = convert_block(img, samples, coefs, cap, check, loops, filt)
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
         with open(p, 'wb') as f:
@@ -613,6 +770,12 @@ ROUTE_STREAMS = [
 # 1:140 (09310000, r100 first call), 1:141 (09400000, r100 call after the s20 truck), 1:142, 1:144,
 # 1:145, 1:152. One-shots streamed through the same ring; disc cost ~4 MB.
 CALL_VOICE_STREAMS = [(1, 140), (1, 141), (1, 142), (1, 144), (1, 145), (1, 152)]
+# The play disc's list through chapter 2-1 (ROUTE_CH21: r10b, r11b, r11a), `--streams ch21`. Each room's streams are
+# appended, so every earlier entry keeps its data bytes (only the 2 KB header grows): 0:4 (r10b, the boss), 0:17 + 1:36
+# (r11b, the battle and the ambush), 1:148 (the r11b radio call voice, 22 s one-shot; requested on r11b entry after
+# the Ope radio 1:3: "stream sbb=9900000 (1:148) not in aica_str.dat" without it).
+CH21_STREAMS = ROUTE_STREAMS + CALL_VOICE_STREAMS + [(0, 4), (0, 17), (1, 36), (1, 148)]
+STREAM_PRESETS = {'ch21': CH21_STREAMS}
 
 
 def nibble_to_sample(n):
@@ -653,7 +816,13 @@ def decode_stream(sbb, shd):
             o = shd['offset'] + blk * half * nch + c * half
             data += sbb[o:o + half]
             blk += 1
-        coef = (tuple(shd['coefs'][c]), (0, 0, shd['yn1'][c] & 0xFFFF, shd['yn2'][c] & 0xFFFF, 0, 0, 0))
+        # SND_SHD keeps a1 of the 8 predictor pairs in coef[0..7] and a2 in coef[8..15]
+        # (snd_str3.cpp: adpcm.a[i] = {coef[i], coef[i + 8]}); dsp_decode wants the pairs
+        # interleaved, as in a wavetable. Read as interleaved pairs, the filters are
+        # unstable and the decoded stream saturates (issue lamb2k/re4dc#15).
+        sc = shd['coefs'][c]
+        pairs = tuple(v for i in range(8) for v in (sc[i], sc[i + 8]))
+        coef = (pairs, (0, 0, shd['yn1'][c] & 0xFFFF, shd['yn2'][c] & 0xFFFF, 0, 0, 0))
         chans.append(dsp_decode(bytes(data[:need]), 0, shd['samples'], coef, None))
     return chans
 
@@ -759,7 +928,7 @@ def build_streams(mirror, out, keys):
     return report
 
 
-STREAM_VERSION = 2   # bump when build_streams output changes
+STREAM_VERSION = 3   # bump when build_streams output changes
 
 
 def cached_streams(mirror, out, keys, cache_dir):
@@ -818,6 +987,115 @@ def disc(mirror, out, cache_dir, rooms, keys, json_out, weapons=()):
                                               free - MOVIE_RESERVE, sum(n for _, n in rep['overlay']), len(keys)))
 
 
+BANK_EXTS = ('.dar', '.drs', '.das', '.snd', '.dat')
+
+
+def file_bases(root, rel):
+    """Archive bases of a disc / mirror file: container entries for bio4midi.dat / doorse.dat, else [0]."""
+    if rel.endswith('bio4midi.dat') or rel.endswith('doorse.dat'):
+        return archive_bases(root, rel + '#*')[1]
+    return [0]
+
+
+def reconvert(root, mirrors, out, cache_dir, json_out=None, only=None):
+    """Re-run the decimation of every prebuilt bank already on a disc tree with the current filter, keeping
+    each AicaBankHeader (cap, sizes, slot, layout) and the image size exactly. The GC sample data comes from
+    the unconverted mirror(s) (same path, block found by wavetable hash + part size). Proof of identical inputs:
+    the box conversion (filter 1) of that source must reproduce the disc's image byte for byte, else the file
+    is reported and left alone. Writes only changed files to `out` (relative paths)."""
+    rep = {'filter_version': FILTER_VERSION, 'files': [], 'refused': []}
+    for dirpath, dirs, files in os.walk(root):
+        dirs.sort()
+        for fn in sorted(files):
+            if not fn.endswith(BANK_EXTS):
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, fn), root)
+            if only and rel not in only:
+                continue
+            with open(os.path.join(root, rel), 'rb') as f:
+                d = bytearray(f.read())
+            try:
+                bases = file_bases(root, rel)
+            except (OSError, ValueError, struct.error):
+                continue
+            todo = []
+            for base in bases:
+                for (t, mo, ms, ao, asz) in (sound_blocks(bytes(d), base) or []):
+                    if ao + HDR_SIZE <= len(d) and struct.unpack_from('<I', d, ao)[0] == MAGIC:
+                        todo.append((t, mo, ms, ao, asz))
+            if not todo:
+                continue
+            src_blocks = None
+            for m in mirrors:
+                p = os.path.join(m, rel)
+                if not os.path.exists(p):
+                    continue
+                with open(p, 'rb') as f:
+                    md = f.read()
+                blk = {}
+                try:
+                    mb = file_bases(m, rel)
+                except (OSError, ValueError, struct.error):
+                    continue
+                for base in mb:
+                    for (t, mo2, ms2, ao2, asz2) in (sound_blocks(md, base) or []):
+                        if struct.unpack_from('<I', md, ao2)[0] == MAGIC:
+                            continue
+                        table, samples, coefs = wavetable(md, t, mo2, ms2)
+                        blk.setdefault((fnv1a(table), asz2), md[ao2:ao2 + asz2])
+                need = set()
+                for (t, mo, ms, ao, asz) in todo:
+                    table, _, _ = wavetable(bytes(d), t, mo, ms)
+                    need.add((fnv1a(table), asz))
+                if need <= set(blk):
+                    src_blocks = (m, blk)
+                    break
+            if src_blocks is None:
+                rep['refused'].append({'file': rel, 'why': 'no mirror holds the GC source of every block'})
+                print('  %s: REFUSED (no mirror source)' % rel)
+                continue
+            n_new, ok = 0, True
+            rows = []
+            for (t, mo, ms, ao, asz) in todo:
+                h = HDR.unpack_from(d, ao)
+                cap, total, nsmp, fnv = h[2], h[3], h[4], h[5]
+                table, samples, coefs = wavetable(bytes(d), t, mo, ms)
+                gc = src_blocks[1][(fnv1a(table), asz)]
+                if fnv != fnv1a(table) or nsmp != len(samples):
+                    ok = False
+                    rows.append({'aram_ofs': ao, 'why': 'header does not match the wavetable'})
+                    break
+                old, _ = cached_convert(cache_dir, gc, samples, coefs, cap, False, None, 1)
+                cur = bytes(d[ao + HDR_SIZE:ao + HDR_SIZE + total])
+                if len(old) != total or old != cur:
+                    ok = False
+                    rows.append({'aram_ofs': ao, 'why': 'box conversion of the mirror source differs from the disc image'})
+                    break
+                loops = sample_loops(bytes(d), t, mo, ms, len(samples))
+                new, _ = cached_convert(cache_dir, gc, samples, coefs, cap, False, loops)
+                assert len(new) == total, (rel, ao, len(new), total)
+                d[ao + HDR_SIZE:ao + HDR_SIZE + total] = new
+                n_new += 1
+                rows.append({'aram_ofs': ao, 'block': BLOCK_NAMES.get(t, 'EM%d' % (t - 8)), 'cap_hz': cap,
+                             'image_bytes': total, 'samples': len(samples), 'loops': len(loops),
+                             'box_fnv': '%08x' % fnv1a(old), 'aa_fnv': '%08x' % fnv1a(new)})
+            if not ok:
+                rep['refused'].append({'file': rel, 'blocks': rows})
+                print('  %s: REFUSED %s' % (rel, rows[-1]['why']))
+                continue
+            dst = os.path.join(out, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, 'wb') as f:
+                f.write(d)
+            rep['files'].append({'file': rel, 'mirror': src_blocks[0], 'blocks': rows,
+                                 'sha256': hashlib.sha256(bytes(d)).hexdigest()})
+            print('  %s: %d banks refiltered (mirror %s)' % (rel, n_new, src_blocks[0]))
+    if json_out:
+        with open(json_out, 'w') as f:
+            json.dump(rep, f, indent=1)
+    return rep
+
+
 def merge(mirror, overlay, out):
     """Hardlink `mirror` into `out` (no data copied), then link the overlay files over it."""
     if os.path.exists(out):
@@ -842,8 +1120,10 @@ def merge(mirror, overlay, out):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
-    ap.add_argument('cmd', choices=('plan', 'build', 'merge', 'streams', 'disc'))
-    ap.add_argument('--streams', default=','.join('%d:%d' % k for k in ROUTE_STREAMS), help='blk:no list')
+    ap.add_argument('cmd', choices=('plan', 'build', 'merge', 'streams', 'disc', 'reconvert'))
+    ap.add_argument('--root', help='reconvert: a disc data tree whose prebuilt banks are refiltered '
+                    '(--mirror may list several unconverted mirrors, comma separated, tried in order)')
+    ap.add_argument('--streams', default=','.join('%d:%d' % k for k in ROUTE_STREAMS), help='blk:no list, or a preset name: ' + ', '.join(sorted(STREAM_PRESETS)))
     ap.add_argument('--call-voices', action='store_true',
                     help='add CALL_VOICE_STREAMS (the radio call voices) to --streams')
     ap.add_argument('--overlay')
@@ -858,10 +1138,18 @@ def main():
     ap.add_argument('--json')
     ap.add_argument('--check', action='store_true', help='decode the AICA output and report SNR')
     a = ap.parse_args()
+    if a.streams in STREAM_PRESETS:   # a named list (ch21: the chapter 2-1 play disc), call voices included
+        a.streams = ','.join('%d:%d' % k for k in STREAM_PRESETS[a.streams])
     if a.call_voices:
         a.streams = ','.join([k for k in a.streams.split(',') if k] + ['%d:%d' % k for k in CALL_VOICE_STREAMS])
     if a.cmd == 'merge':
         return merge(a.mirror, a.overlay, a.out)
+    if a.cmd == 'reconvert':
+        if not (a.root and a.out):
+            raise SystemExit('reconvert needs --root and --out')
+        rep = reconvert(a.root, [m for m in a.mirror.split(',') if m], a.out, a.cache, a.json)
+        print('reconvert: %d files refiltered, %d refused' % (len(rep['files']), len(rep['refused'])))
+        return 1 if rep['refused'] else 0
     if a.cmd == 'disc':
         if not (a.out and a.cache):
             raise SystemExit('disc needs --out and --cache')

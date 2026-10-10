@@ -17,6 +17,26 @@
 #include "main_sub.h"
 #include "joy.h"
 
+#ifndef RE4DC_WATER45_LEAN
+#define RE4DC_WATER45_LEAN 0
+#endif
+// RE4DC_WATER45_GRID_SKIP (ROUTE_CH13, r10b; needs RE4DC_WATER45_LEAN): no height-field grid at all.
+// Logic reads only the plane (mat / inv / nx / ny: GetWaterHeight, GetWaterCrossPos); the grid feeds
+// only the GX draw. The grid update takes no RNG; the init keeps its fRand1_1 calls (shared RNG).
+#ifndef RE4DC_WATER45_GRID_SKIP
+#define RE4DC_WATER45_GRID_SKIP 0
+#endif
+// RE4DC_WATER45_NATIVE (ROUTE_CH13, r10b; needs RE4DC_WATER45_LEAN): the water surface drawn natively
+// (re4dc_water45_draw): the flat plane (mat) over the grid and its far border, the GameCube's "scene behind x
+// TEV colour" as a PVR multiply. Without it nothing draws the lake (GX is a stub; the PS2 world has no water
+// mesh) and the fog-coloured background shows through. Render only: reads the plane, writes nothing.
+#ifndef RE4DC_WATER45_NATIVE
+#define RE4DC_WATER45_NATIVE 0
+#endif
+#if RE4DC_WATER45_NATIVE && !RE4DC_WATER45_LEAN
+#error RE4DC_WATER45_NATIVE replaces the GX draw that RE4DC_WATER45_LEAN removes
+#endif
+
 // Effect controller 45: weather water surface (same height-field model as Espgen42, following the
 // camera). The Estgen45Set* entry points let the room script (esp4c) override its parameters.
 // Espgen42 owns the water init (EspWaterInit): it resets this unit's overrides and g_pWater45.
@@ -226,6 +246,9 @@ void Espgen45_Move00(EspgenWork* w)
     if (tex == NULL) {
         return;
     }
+#if RE4DC_WATER45_GRID_SKIP
+    return;
+#endif
     noise = (u8*) GXGetTexObjData(tex) + 0x80000000;
     u32 nx = p->nx;
     f32 hx = (f32) (int) (nx / 2);
@@ -301,6 +324,7 @@ void Espgen45_Move00(EspgenWork* w)
                 // `lfs g45_wave_mul`; the plain static read is a fixed scalar that never aliases the in-struct store
                 // and floated 6 insns up. The pos address is computed before the store (target `lwz pos` early).
                 pv->y = next[k] = (n * FGet(g45_wave_mul) + next[k]) * spread;
+#if !RE4DC_WATER45_LEAN
                 Vec* nrm = p->nrm;   // before the v.x/v.z reads: kept across the call (`lfsx nrm[k].x`, `4(nrm+k*12)`)
                 v.x = p->pos[k - 1].y - p->pos[k + 1].y;
                 v.y = 2.0f;
@@ -323,6 +347,7 @@ void Espgen45_Move00(EspgenWork* w)
                 nrm[k].x += (fx - hx) * inx;
                 nrm[k].z += (fy - hy) * iny;
                 nrm[k].y *= 0.25f;
+#endif
                 fx += 1.0f;
                 k++;
             }
@@ -361,6 +386,7 @@ void Espgen45_Move00(EspgenWork* w)
                 HB *= 0.92f;
 #undef HB
                 pv->y = n * 0.0018f + hA[k];
+#if !RE4DC_WATER45_LEAN
                 Vec* nrm = p->nrm;
                 v.x = p->pos[k - 1].y - p->pos[k + 1].y;
                 v.y = 2.0f;
@@ -395,6 +421,7 @@ void Espgen45_Move00(EspgenWork* w)
                 nrm[k].x += ((f32) j - (f32) (p->nx / 2)) * (1.0f / (f32) (int) p->nx);
                 nk->z += ((f32) i - (f32) (p->ny / 2)) * (1.0f / (f32) (int) p->ny);
                 nk->y *= 0.25f;
+#endif
                 k++;
             }
             asm("" : : "r"(dead));   // COMPILER-DIFF: use of the moved asm set (see above); emits nothing
@@ -403,8 +430,10 @@ void Espgen45_Move00(EspgenWork* w)
     {
         u32 n = sizeof(Vec) * (p->nx + 1) * (p->ny + 1);   // nx first: fold attaches the 12 to (ny + 1) as the target
         DCStoreRange(p->pos, n);
+#if !RE4DC_WATER45_LEAN
         DCStoreRange(p->nrm, n);
         DCStoreRange(p->bump, sizeof(Vec) * (p->nx + 1) * (p->ny + 1));
+#endif
     }
 }
 
@@ -419,12 +448,153 @@ void Espgen45_Move(EspgenWork* w)
     Espgen45MoveTbl[w->step](w);
 }
 
+#if RE4DC_WATER45_NATIVE
+extern "C" {
+void GXGetProjectionv(f32* p);
+void GXGetViewportv(f32* v);
+float re4dc_fog_amount(float z);                    // platform/native_static.cpp
+int re4dc_water45_quad(const float positions[4][3], const float rgb[4][3], const float* projection,
+                       const float* viewport);      // platform/native_ui.cpp
+}
+// Espgen45_TransSub's surface, natively: the GX path's far border (g45_mul = 15 grid sizes, unless flag bit 0
+// bounds it to the grid) and grid as one flat plane in grid space (y 0), cut into WATER45_CELLS x WATER45_CELLS
+// cells spaced t*|t| (fine near the centre, which follows the camera target). Each corner's factor is the
+// GameCube's result over the scene behind: TEV C0 (col, overrides applied) x screen (stage 0; the raster alpha that
+// blends it is the channel's white material alpha, 1), fogged toward the background: m = lerp(col, 1, fog).
+// Cells whose four corners are fully fogged multiply by 1 and are skipped. No bump, refraction warp or specular.
+#define WATER45_CELLS 16
+extern "C" void re4dc_water45_draw(EspgenWork* w)
+{
+    if (G_ROOM_ID != 0x10b) {
+        return;   // r10b only: the one espgen45 room the route draws and proves
+    }
+    Espgen42Work* p = (Espgen42Work*) w->work;
+    GXColor col = p->col;
+    if (g_bColorOverWrite == 1) {
+        col.r = g_r; col.g = g_g; col.b = g_b; col.a = g_a;
+    } else if (g_bColorMul == 1) {
+        col.r = (u8) ((f32) col.r * (f32) (int) g_r / 255.0f);
+        col.g = (u8) ((f32) col.g * (f32) (int) g_g / 255.0f);
+        col.b = (u8) ((f32) col.b * (f32) (int) g_b / 255.0f);
+    }
+    CameraCurrentProjection();
+    f32 projection[7];
+    f32 viewport[6];
+    GXGetProjectionv(projection);
+    GXGetViewportv(viewport);
+    Mtx mv;
+    PSMTXConcat(pG->Cam.v_mat, p->mat, mv);
+    const f32 c[3] = {(f32) col.r / 255.0f, (f32) col.g / 255.0f, (f32) col.b / 255.0f};
+    const f32 ex = (p->flag & 1) ? (f32) (int) (p->nx >> 1) : 7.5f * (f32) (int) p->nx;
+    const f32 ez = (p->flag & 1) ? (f32) (int) (p->ny >> 1) : 7.5f * (f32) (int) p->ny;
+    // The cells centre on the eye over the plane (the room may pin the plane's centre: Estgen45SetTargetCamera(0)) and
+    // reach the GX path's border around it (the far cells fade into the fog), clipped to the surface.
+    Mtx vi;
+    Vec eye = {0.0f, 0.0f, 0.0f};
+    Vec le;
+    PSMTXInverse(pG->Cam.v_mat, vi);
+    PSMTXMultVec(vi, &eye, &eye);
+    PSMTXMultVec(p->inv, &eye, &le);
+    const f32 reach = 2.0f * (ex > ez ? ex : ez);   // covers the whole surface from any eye over it
+    // Two rows of corners at a time (view-space position, factor): row j - 1 and row j bound row j - 1's cells.
+    const int n = WATER45_CELLS;
+    f32 row[2][WATER45_CELLS + 1][6];
+    for (int j = 0; j <= n; ++j) {
+        f32 (*cur)[6] = row[j & 1];
+        f32 tz = (f32) (2 * j - n) / (f32) n;
+        tz = tz * (tz < 0.0f ? -tz : tz);
+        for (int i = 0; i <= n; ++i) {
+            f32 tx = (f32) (2 * i - n) / (f32) n;
+            tx = tx * (tx < 0.0f ? -tx : tx);
+            f32 lx = le.x + tx * reach;
+            f32 lz = le.z + tz * reach;
+            lx = lx < -ex ? -ex : lx > ex ? ex : lx;
+            lz = lz < -ez ? -ez : lz > ez ? ez : lz;
+            Vec l = {lx, 0.0f, lz};
+            Vec v;
+            PSMTXMultVec(mv, &l, &v);
+            cur[i][0] = v.x; cur[i][1] = v.y; cur[i][2] = v.z;
+            const f32 f = v.z < 0.0f ? re4dc_fog_amount(-v.z) : 0.0f;
+            for (int q = 0; q < 3; ++q) {
+                cur[i][3 + q] = c[q] + (1.0f - c[q]) * f;
+            }
+        }
+        if (j == 0) {
+            continue;
+        }
+        const f32 (*prev)[6] = row[(j - 1) & 1];
+        for (int i = 0; i < n; ++i) {
+            const f32* k[4] = {prev[i], prev[i + 1], cur[i], cur[i + 1]};
+            f32 pos[4][3];
+            f32 cr[4][3];
+            int unity = 1;
+            int behind = 1;
+            for (int q = 0; q < 4; ++q) {
+                for (int e = 0; e < 3; ++e) {
+                    pos[q][e] = k[q][e];
+                    cr[q][e] = k[q][3 + e];
+                    if (cr[q][e] < 0.998f) {
+                        unity = 0;
+                    }
+                }
+                if (pos[q][2] < 0.0f) {
+                    behind = 0;
+                }
+            }
+            if (unity || behind) {
+                continue;
+            }
+            re4dc_water45_quad(pos, cr, projection, viewport);
+        }
+    }
+}
+
+// The surface's OT entry (layer 0x10, as Espgen45_Trans queues Espgen45_TransSub): drawn in the render pass of the
+// image being built. Espgen45_Trans and the logic-only coarse pass (espgen.cpp) call it; render only.
+extern "C" void re4dc_water45_queue(EspgenWork* w)
+{
+    if (G_ROOM_ID == 0x10b && (w->flag & 1) && !(w->flag & 2)) {
+        AddOtDirect(0x10, w, (void (*)()) re4dc_water45_draw, 1, 0x80, NULL, 0.0f);
+    }
+}
+
+// EspSpriteEmit (esp_sub.cpp): 1 when the r10b surface is drawn natively this frame, the eye is above the plane and all
+// four view-space corners are under it: the GameCube's water Z hides such a sprite (drawn after the water's OT layer).
+extern "C" int re4dc_water45_hides(const f32 (*corner)[3])
+{
+    EspgenWork* w = g_pWater45;
+    if (w == NULL || !(w->flag & 1) || (w->flag & 2) || G_ROOM_ID != 0x10b) {
+        return 0;
+    }
+    Espgen42Work* p = (Espgen42Work*) w->work;
+    // The plane y = h in view space: normal n = R (0, 1, 0), offset d = -(n . (R (0, h, 0) + t)); a point's side is
+    // n . x + d (> 0: above). The eye is the view origin: above when d > 0.
+    const Mtx& V = pG->Cam.v_mat;
+    const f32 h = p->mat[1][3];
+    const f32 nx = V[0][1], ny = V[1][1], nz = V[2][1];
+    const f32 d = -(nx * (V[0][1] * h + V[0][3]) + ny * (V[1][1] * h + V[1][3]) + nz * (V[2][1] * h + V[2][3]));
+    if (!(d > 0.0f)) {
+        return 0;
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (nx * corner[i][0] + ny * corner[i][1] + nz * corner[i][2] + d >= 0.0f) {
+            return 0;
+        }
+    }
+    return 1;
+}
+#endif
+
 // EspgenTransTbl entry: queues Espgen45_TransSub in OT layer 0x10 (drawn after the opaque scene) and
 // clears Status_flg[1] bit 0x20 (the "override parameters changed this frame" flag).
 void Espgen45_Trans(EspgenWork* w)
 {
     if ((w->flag & 1) && !(w->flag & 2)) {
+#if !RE4DC_WATER45_LEAN
         AddOtDirect(0x10, w, (void (*)()) Espgen45_TransSub, 1, 0x80, NULL, 0.0f);
+#elif RE4DC_WATER45_NATIVE
+        re4dc_water45_queue(w);
+#endif
     }
     pG->Status_flg[1] &= ~0x20;
 }
@@ -827,6 +997,11 @@ EspgenWork* SetWaterWork45(EspgenWork* w, Vec* pos, Vec* rot, f32 size, u32 nx, 
         rate = 0.0001f;
     }
     p->mat[1][1] *= rate;
+#if RE4DC_WATER45_GRID_SKIP
+    p->hA = NULL;
+    p->hB = NULL;
+    p->pos = NULL;
+#else
     n = sizeof(f32) * (p->nx + 1) * (p->ny + 1);
 #line 1452 "D:/Bio4/Prog/espgen45.cpp"
     p->hA = (f32*) MEM_ALLOC(n, 1, 13);
@@ -847,6 +1022,8 @@ EspgenWork* SetWaterWork45(EspgenWork* w, Vec* pos, Vec* rot, f32 size, u32 nx, 
         goto nomem;
     }
     memclr_asm(p->pos, n);
+#endif
+#if !RE4DC_WATER45_LEAN
 #line 1475 "D:/Bio4/Prog/espgen45.cpp"
     p->nrm = (Vec*) MEM_ALLOC(n, 1, 13);
     if (p->nrm == NULL) {
@@ -926,12 +1103,35 @@ EspgenWork* SetWaterWork45(EspgenWork* w, Vec* pos, Vec* rot, f32 size, u32 nx, 
             }
         }
     }
+#else
+    // RE4DC_WATER45_LEAN (ROUTE_CH13, r10b): the normal / bump / display-list buffers only feed the GX
+    // draw (refraction + indirect bump), which the Dreamcast does not run: the PS2 world draws the lake.
+    // The height field (hA / hB / pos) and its RNG use are unchanged.
+    p->nrm = NULL;
+    p->bump = NULL;
+    p->dl = NULL;
+    p->dlSize = 0;
+    if (0) {
+    nomem:
+        pLog->err(0, 0, "Espgen45 : not enough memory");
+        PushEspgen(w);
+        return NULL;
+    }
+#endif
     // One counter pair for the init loops: `jj` (inner fRand loop, then the two x edges: it crosses the
     // call, so callee-saved r28) and `i2`/`idx` (fRand rows, `i2 = p->ny` for the far edge, the two y edges).
-    fy = 0.0f;
     int jj;
     int i2;
     int idx;
+#if RE4DC_WATER45_GRID_SKIP
+    for (i2 = 0; i2 < p->ny + 1; i2++) {
+        for (jj = 0; jj < p->nx + 1; jj++) {
+            (void) fRand1_1();   // the grid init's shared-RNG draws, same count and order
+        }
+    }
+    return w;
+#else
+    fy = 0.0f;
     for (i2 = 0; i2 < p->ny + 1; i2++) {
         idx = i2 * (p->nx + 1);
         fx = 0.0f;
@@ -940,15 +1140,19 @@ EspgenWork* SetWaterWork45(EspgenWork* w, Vec* pos, Vec* rot, f32 size, u32 nx, 
             p->pos[idx].y = fRand1_1() * 0.2f;
             fx += 1.0f;
             p->pos[idx].z = fy - (f32) (int) (p->ny / 2);
+#if !RE4DC_WATER45_LEAN
             p->nrm[idx].x = 0.0f;
             p->nrm[idx].y = 1.0f;
             p->nrm[idx].z = 0.0f;
+#endif
             p->hA[idx] = 0.0f;
             p->hB[idx] = 0.0f;
+#if !RE4DC_WATER45_LEAN
             Vec* n = &p->nrm[idx];
             n->x += ((f32) jj - (f32) (int) (p->nx / 2)) * (1.0f / (f32) (int) p->nx);
             n->z += ((f32) i2 - (f32) (int) (p->ny / 2)) * (1.0f / (f32) (int) p->ny);
             n->y *= 0.25f;
+#endif
             idx++;
         }
         fy += 1.0f;
@@ -981,16 +1185,23 @@ EspgenWork* SetWaterWork45(EspgenWork* w, Vec* pos, Vec* rot, f32 size, u32 nx, 
     {
         u32 n2 = sizeof(Vec) * (p->nx + 1) * (p->ny + 1);
         DCStoreRange(p->pos, n2);
+#if !RE4DC_WATER45_LEAN
         DCStoreRange(p->nrm, n2);
+#endif
     }
+#if !RE4DC_WATER45_LEAN
     DCStoreRange(p->bump, sizeof(Vec) * (p->nx + 1) * (p->ny + 1));
+#endif
     {
         u32 n3 = sizeof(f32) * (p->nx + 1) * (p->ny + 1);
         DCStoreRange(p->hA, n3);
         DCStoreRange(p->hB, n3);
     }
+#if !RE4DC_WATER45_LEAN
     DCStoreRange(p->dl, p->dlSize);
+#endif
     return w;
+#endif   // RE4DC_WATER45_GRID_SKIP
 }
 
 // Frees the six grid buffers and clears g_pWater45.

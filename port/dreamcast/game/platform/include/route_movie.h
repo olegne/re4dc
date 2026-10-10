@@ -5,6 +5,13 @@
 enum {
     ROUTE_MOVIE_SND_EVENT = 1,  // evd header sndFlag bit31 clear: SndEventInit/SndEventEnd
     ROUTE_MOVIE_KEEP_POSE = 2,  // caller sets Event StatusFlag 0x800: ExeEndEvt keeps the pose
+    // RouteMoviePlayQte only (ROUTE_CH13 builds): the cut runs Event::ExecActBtn each frame (the source
+    // Event::Run's button-mash prompt and count) and the end func sees that same event (GetActBtnCount).
+    ROUTE_MOVIE_ACT_COUNT = 4,
+    // ROUTE_CH21 builds: the source call was EvtReadExec(.., flags 0x80), the "true" scenario start: SceEventStart(1)
+    // leaves enemies / objects out of event mode (r119 s30, the parasite, mid-fight); EvtReadExec's camera
+    // Comeback runs at the end, as SceEventEnd's mode-1 path does not.
+    ROUTE_MOVIE_SCE_TRUE = 8,
 };
 class Event;
 typedef void (*RouteEvtFunc)(Event*);

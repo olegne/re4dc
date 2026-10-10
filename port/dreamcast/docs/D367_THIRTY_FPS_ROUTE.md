@@ -1,5 +1,137 @@
 # D367: 30 fps on real hardware, three-room route
 
+## 2026-10-10: r117, the chapter 2-1 end (ROUTE_CH21, lane r117)
+
+- r118 door 4 -> r117 -> s00 (Ashley) -> s10 (Saddler) -> "End of Chapter 2-1" + Save (route doc "r117"). Ashley
+  (pl11) is a room overlay; em11 ships prepared (motion leases). CH21 discs now play their streams: aica_str.dat
+  has 17 entries and the player read 16. H2 + bell STRICT, MUST-IDENTICAL; s30 heap_before 61,600 (floor 57,504).
+  Next: chapter 2-2 (r118 part 1 -> r112 -> r111 -> r113 -> r11c).
+
+## 2026-10-10: r118 past El Gigante (ROUTE_CH21, lane r118)
+
+- r119 door 0 -> r118 -> back, and r118's r117 door shows "Coming Soon" (route doc "r118"). Code is the r118 BGM0
+  slot (snd.cpp, CH21) + aica_banks + warp presets; the rest is staged data. HALT 0, MISSING 0. Next: r117.
+
+## 2026-10-10: ACTOR_EXACT_FAST, r119 exact-lit trees (lane r118)
+
+- Render only, default 1 with ROUTE_CH21 (route doc "ACTOR_EXACT_FAST"): r119 quiet 109.3 -> 93.8 hw ms drawn;
+  boss 88.0 -> 89.5 (unchanged: the giant is GC-drawn, next item). H2 + bell STRICT, MUST-IDENTICAL.
+
+## 2026-10-10: LINK_TIGHT + LINK_OVL_HELPERS, heap margin for CH21 (lane r118)
+
+- Link-only, default 1 with ROUTE_CH21 (route doc "LINK_TIGHT"): the KOS script's empty icache-aligned .sub0..9
+  padding is gone and single-overlay helpers move into their room overlay. Trace `_end` -9.4 KB, play -12.3 KB;
+  s30 heap_before 57,504 -> 65,696. MOVIE_FENCE_RETRY (timing only) keeps a not-ready fence from ending a movie.
+  H2 + bell STRICT, MUST-IDENTICAL; New Game, r10b, r11b, r11a, r119 play through.
+
+## 2026-10-10: r119, El Gigante (ROUTE_CH21, lane r119)
+
+- r119 plays from r11a door 0 through s00 / s10 / s20 / s30 (PS2 movies) to the giant's death; exits to r118 / r10e
+  show "Coming Soon" (route doc "r119"). em2b is a room overlay; its archive fits heap 4 only prepared (textures to
+  native packages + motion leases: 4.79 MB -> 2.26 MB body; r119's largest free cell is 2.77 MB).
+- r119 hw ms (cost arm, drawn / skipped): quiet 112.0 / 7.3, boss 90.6 / 11.7; RENDER dominates (source-drawn room
+  models 59 ms in the quiet view). Flycast p50 72.1 / 62.6. Gates on d74b8ec8: H2 + bell STRICT / MUST-IDENTICAL,
+  s30 heap_before 57,504 = control (the CH21 trace image is page-tight: keep r119.cpp lean).
+
+## 2026-10-10: WATER42_GRID_SKIP, r10a / r11a lake water (ROUTE_CH13 block, lane fix21)
+
+- espgen42 keeps only its water plane (the only thing logic reads: GetWaterHeight / GetWaterCrossPos /
+  AddWaterPower bounds); the GX-only height grid and its per-frame update are skipped, init RNG draws kept. It runs in
+  r10a and r11a only (scan of every effect record on GC disc 1). STRICT in r11a (three views) and r10a; H2 / bell
+  STRICT, MUST-IDENTICAL; s30 heap_before 65,696 >= 57,504. Route doc "WATER42_GRID_SKIP".
+- r11a hw ms: quiet 58.8 -> 41.2 drawn work (LOGIC 29.3 -> 16.4; now under the 30 fps cap), Ganados 68.1 -> 49.3
+  drawn (LOGIC 34.3 -> 14.1). Flycast p50 36.2 -> 27.2 (29.9 fps), 42.1 -> 35.1.
+
+## 2026-10-10: r11a, chapter 2-1 (ROUTE_CH21 image unchanged, lane r11a)
+
+- r11a plays from r11b door 0; door 0 to r119 shows "Coming Soon" (route doc "r11a"). It is data only: the room
+  container, the PS2 world, textures, and the AICA room bank (em24 added). The image is unchanged.
+- r11a hw ms (cost arm, drawn / skipped): quiet 58.8 / 39.0, Ganados 68.1 / 37.0. LOGIC is ~27 ms in both, ~18 of
+  it from espgen42's water grid. Flycast p50 36.2 / 42.1. Next perf item: an espgen42 grid skip (WATER45 pattern,
+  needs its own audit + STRICT).
+
+## 2026-10-10: r11b, chapter 2-1's start (ROUTE_CH21, lane r11b)
+
+- r11b plays from the r10b door 6 transition (after the chapter 1-3 save); r11a / r10c / r10d show "Coming Soon"
+  (route doc "r11b"). em22 (wolves) is a heap-4 room overlay; `_end` in the same 4 KiB page as 67fda5c8; H2 and bell
+  STRICT / MUST-IDENTICAL; s30 heap_before 57,504 = control.
+- r11b hw ms (cost arm, drawn): landing 40.0, wolf ambush 81.6 (LOGIC 12.5, RENDER 49.6). Flycast p50 34.4 / 50.5.
+
+## 2026-10-10: r10b to chapter 1-3's end (ROUTE_CH13, lane r10b)
+
+- r10b plays to SceSetChapterEnd(CHAPTER_1_3, 6) and "Coming Soon" at door 6 (route doc "r10b"). The boat (pl0f) and
+  Del Lago (em2f) are heap-4 room overlays (ROUTE_OVL): the resident image is no larger than 19f62e62's (`_end` in
+  the same 4 KiB page; s30 heap_before 57,504 = control). H2 and bell STRICT / MUST-IDENTICAL against 19f62e62.
+- r10b hw ms (cost arm, drawn): dock 127.9 -> 61.3, lake 63.3 -> 60.2, boss pass (Del Lago within 2 m, frame ~4139) 42.6 -> 39.5. Two fixes: the em27 fish
+  NaN (raw slot math read an unbacked sparse slot) and espgen45's GX-only height grid skipped (no RNG; STRICT pair).
+
+## 2026-10-09: PACE_CAP=2 measured against the play recipe (decision pending)
+
+The user asked to revisit PACE_CAP=2 now that the logic lane found no exact speedups left. The play default stays
+PACE_CAP=1 (Fast). Evidence: D:/Flycast-Evidence/re4-dreamcast/pace2-20261009; review sheet and strip charts:
+C:/Game Dev/Emulators/pace2-review.
+
+- What it does (pace.cpp/pace.mk, compile time only): logic keeps the 29.97 Hz vblank clock in every setting. When
+  the game is at least one tick (2 vblanks) behind, an iteration runs its whole logic tick with the image dropped
+  (v2: no model OT, no present). PACE_CAP is the most consecutive dropped images: 1 = up to 2 ticks per drawn frame,
+  2 = up to 3. Fast mode only takes the second drop (Smooth's 15 fps floor blocks it; Off disables pacing). Below
+  real time either way the game runs in slow motion: speed = ticks per second / 29.97. No runtime or Options
+  selection exists; RE4DCCFG stores only the mode (2 bits, all used).
+- hw model on the 19f62e62 recipe (cost arms PACE_FORCE=2 and PACE_FORCE=T, stride 7), console factor 1.155
+  outdoors (world submitted) and 1.03 indoors, replayed through the pacing rule (tools/d367/pacesim.py):
+
+  | view (window) | model ms drawn / skipped | PACE_CAP=1 speed / fps | PACE_CAP=2 speed / fps |
+  |---|---:|---:|---:|
+  | r101 square fight, worst view, ACT_CAP=0 (1330:1409) | 71.10 / 25.20 | 60% / 9.0 | 71% / 7.1 |
+  | r100 house fight (2300:2379) | 54.30 / 22.33 | 75% / 11.3 | 88% / 8.8 |
+  | r100 quiet outdoor (1240:1319) | 39.47 / 11.68 | 100% / 18.6 | 100% / 18.6 |
+  | r100 house interior, quiet (800:879) | 38.33 / 12.35 | 100% / 23.1 | 100% / 23.1 |
+
+  A second consecutive skip costs what a first does (D S S arm: square 25.04, fight 21.43). Input latency (pad read
+  to the image showing it): square 105 -> 120 ms mean, fight 84 -> 97. Views already at 100% are unchanged.
+- Logic STRICT (Flycast, ACT_CAP=0, trace builds of the recipe):
+  - bell: PACE_CAP=2 Fast vs the unpaced control route-ti-bellB: whole room STRICT, decision_cmp MUST-IDENTICAL
+    (5,102 ticks; Flycast ran the fight in the saturated D S S pattern throughout).
+  - H2: PACE_CAP=2 Fast vs the unpaced control: STRICT to 740. The r100s03 movie (ticks 741..) ends on wall time,
+    and any paced arm reaches its end at a different tick (control 1217, PACE_CAP=1 Fast 1216, PACE_CAP=2 Fast
+    1215); the padscript and Frame_cnt-scheduled work then fall on other ticks, so the later windows differ, as for
+    any timing change.
+  - Equalised pair: PACE_CAP=1 vs PACE_CAP=2, both Fast with PACE_TEST_DRAW_US=40000 (the same emulated draw load,
+    so the movie ends at tick 1213 in both and the r101 load completes at 180 in both): H2 STRICT 1450..1569 /
+    ..740 / 1218.., whole room STRICT, decision_cmp MUST-IDENTICAL (5,808 ticks); bell whole room STRICT,
+    MUST-IDENTICAL (4,374). One arm drew D S, the other D S S.
+- Flycast (vsync off) does not reproduce hardware pacing: its vblanks outrun the guest timer, so even the unpaced
+  control shows 58% speed at 29 ms of work. Its PACE windows only confirm the direction (H2 tail: CAP 1 69%
+  13.1 fps, CAP 2 81% 8.0 fps).
+- A runtime choice (a fourth "Fast+" value) would need: the cap as a variable in pace.cpp (want_skip, the
+  lag-drop limit, kKeepVb), a third RE4DCCFG pacing bit, the chord and quality.txt values. The in-game Options row
+  itself is still unbuilt.
+
+## 2026-10-09: issue 9 diagnostics and issue 15 audio (test build)
+
+- Issue 9 (bridge presentation hang on hardware): the first-failure snapshot
+  also latches ASIC_ACK_A/B/C and TA_OPB_INIT, printed as one `asic` line on
+  the stop screen (render-done lost vs ISP/TA overflow). Failure path only;
+  `_end` +32 B in the same 4 KiB page, arena and s30 heap unchanged.
+- Issue 15 (crushed audio): disc streams are decoded with the SND_SHD
+  coefficient order (STREAM_VERSION 3). Clipped samples in the staged
+  aica_str.dat: 0:2 763,211 -> 11, 0:8 1,177,151 -> 2, 1:3 80,601 -> 0,
+  1:14 216,988 -> 2, 1:140 163,020 -> 0, 1:141 88,322 -> 0, 1:152 71,647 -> 0.
+- Prebuilt banks use an anti-alias decimator (aica_banks.py decimate_aa,
+  Kaiser sinc, FILTER_VERSION 2; loops filtered circularly). Same sizes,
+  headers and layout; the runtime converter is unchanged. Banks on the disc:
+  1,579 -> 2,730 clipped of 16.0 M samples (sinc keeps peaks the box average
+  flattened). Existing discs are refiltered with `aica_banks.py reconvert`.
+- TA_GUARD=1 was not used: it skips parts once the TA estimate passes its
+  reserve (drawing changes) and is rejected with COARSE_ONE_SUBMIT=1. The
+  ASIC ACK line already shows TA/ISP overflow bits without it.
+- Gates (Flycast, ACT_CAP=0): H2 STRICT 1450..1569 / ..740 / 1218.., bell
+  STRICT, decision_cmp MUST-IDENTICAL; s30 340/340 at heap_before 55,392 with
+  calls 1:141 and 1:152 played and backing restored; New Game 1971/2360/1175;
+  cold Load inventory set (Combine, Examine, rotation, three exact restores).
+  Play disc payloads equal the 631cb271 disc except 1ST_READ.BIN, sscrn.ovl,
+  aica_str.dat and the 39 bank files. Physical console results pending.
+
 ## 2026-10-08: hanging lamp fire and combined manual candidate
 
 Admit source lamp effect owner 0x5e through the native sprite filter, preserving
