@@ -152,7 +152,7 @@ extern "C" int re4dc_actor_hair_texture_key(const Re4dcUiImage* i,unsigned* c,un
 }
 extern "C" unsigned re4dc_actor_material_runs_capability(const Re4dcActorPlan* p) {
     // The hair runs of the included header: 14 (leon_hair_runs.h), 2 with CHARBAKE_HAIR (leon_hair_runs_g2.h).
-    constexpr unsigned kHair=leon_hair_runs::run_count;
+    constexpr unsigned kHair=sizeof(leon_hair_runs::runs)/sizeof(leon_hair_runs::runs[0]);
 #if RE4DC_ACTOR_PL08
     // pl08 (0x108): nine roles; the same hair (role 7, pl00's runs 7..20) and one role-8 run last, its whole chunk.
     const bool pl08=p && p->appearance==0x108;

@@ -23,6 +23,12 @@ The cast-only Ganado adapter no longer requires the unused historical
 ganado874_runtime.h. The original and comparison adapters still require the
 real header. No generated data or SDK header is replaced by a stub.
 
+The first full compilation exposed a legacy header interface difference: the
+real recovered hair header has `runs[14]` but no named `run_count`. The material
+capability check now derives its compile-time count from the actual runs array,
+which also supports the newer two-run header. Mesh, material and stream bytes
+are unchanged. The failed build and log are retained; retries use new objects.
+
 ## Recovered inputs and reproducible build
 
 The five real generated headers were recovered from the previous private R02
