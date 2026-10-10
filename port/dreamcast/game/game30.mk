@@ -696,6 +696,12 @@ endif
 #                      each attempt ("GCAST" lines: both / cast only / 874 only / neither, role mismatches).
 COARSE_GANADO_CAST ?= 0
 COARSE_GANADO_SRC := coarse_ganado.cpp
+COARSE_GANADO_874_DEP := $(COARSE_ACTOR_ASSET_DIR)/ganado874_runtime.h
+# The cast-only adapter does not include the historical 874 matcher.
+# Keep its real header required for the original and comparison adapters.
+ifeq ($(COARSE_GANADO_CAST),1)
+COARSE_GANADO_874_DEP :=
+endif
 ifneq ($(COARSE_GANADO_CAST),0)
 ifneq ($(COARSE_GANADO),1)
 $(error COARSE_GANADO_CAST needs COARSE_GANADO=1)
@@ -740,7 +746,7 @@ COARSE_FREEZE_AT ?= 0
 ifneq ($(COARSE_FREEZE_AT),0)
 $(OBJDIR)/coarse_ganado.o: GAME_CPPFLAGS += -DRE4DC_COARSE_FREEZE_AT=$(COARSE_FREEZE_AT)
 endif
-$(OBJDIR)/coarse_ganado.o: $(COARSE_GANADO_SRC) $(COARSE_ACTOR_ASSET_DIR)/ganado874_runtime.h
+$(OBJDIR)/coarse_ganado.o: $(COARSE_GANADO_SRC) $(COARSE_GANADO_874_DEP)
 	@mkdir -p $(dir $@)
 	kos-c++ $(KOS_CFLAGS) $(GAME_CPPFLAGS) -DRE4DC_COARSE_GANADO_LIMIT=$(COARSE_GANADO_LIMIT) -I$(COARSE_ACTOR_ASSET_DIR) -MMD -MP -c $< -o $@
 endif

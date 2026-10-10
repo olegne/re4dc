@@ -10,6 +10,7 @@ endif
 $(OBJDIR)/serial-log-config.h: serial-log-force tools/gen_serial_log_config.py
 	@mkdir -p $(dir $@)
 	@python3 tools/gen_serial_log_config.py --enabled $(SERIAL_LOG) --output $@
-SERIAL_LOG_OBJS = $(addprefix $(OBJDIR)/platform/,serial_log.o fault.o os.o mem.o)
+SERIAL_LOG_OBJS = $(addprefix $(OBJDIR)/platform/,serial_log.o fault.o os.o mem.o crash_screen.o)
 $(SERIAL_LOG_OBJS): $(OBJDIR)/serial-log-config.h platform/include/serial_log.h
 $(SERIAL_LOG_OBJS): PLATFORM_CPPFLAGS += -include $(OBJDIR)/serial-log-config.h
+$(OBJDIR)/platform/crash_screen.o: platform/include/serial_stop_report.h

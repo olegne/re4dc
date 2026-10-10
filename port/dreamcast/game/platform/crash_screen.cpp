@@ -62,9 +62,9 @@ struct MissingSnapshot {
     bool valid, pvr_valid;
 };
 MissingSnapshot g_missing{};
-
+#include "serial_stop_report.h"
 void capture_missing(const char* name)
-{
+{ RE4DC_SERIAL_STOP_CAPTURE_DECL
     const int old = irq_disable();
     if (!g_missing.valid) {
         snprintf(g_missing.reason, sizeof(g_missing.reason), "%s", name ? name : "unknown");
@@ -95,9 +95,9 @@ void capture_missing(const char* name)
                     g_missing.latch[i][0] = 0;
 #endif
         }
-        g_missing.valid = true;
+        g_missing.valid = true; RE4DC_SERIAL_STOP_CAPTURE_FIRST();
     }
-    irq_restore(old);
+    irq_restore(old); RE4DC_SERIAL_STOP_CAPTURE_EMIT();
 }
 
 int collect(kthread_t* t, void*)
@@ -316,7 +316,7 @@ void* watchdog(void*)
             still = 0;
             continue;
         }
-        if (++still == 30) {
+        if (++still == 30) { RE4DC_SERIAL_STOP_WATCHDOG_EMIT();
             re4dc_log("CRASH_SCREEN: no new frame for 30 s (ui frame %u)\n", ui);
             show(g_missing.valid ? "MISSING" : "HANG",
                  g_missing.valid ? g_missing.reason : "no new frame for 30 s", false);

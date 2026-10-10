@@ -182,7 +182,9 @@ int main(){
     with tempfile.TemporaryDirectory(prefix="re4dc-crash-report-") as tmp:
         cpp, binary = Path(tmp) / "fixture.cpp", Path(tmp) / "fixture"
         cpp.write_text(fixture)
-        subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", str(cpp), "-o", str(binary)], check=True)
+        subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-DRE4DC_SERIAL_LOG=0",
+                        "-I", str(ROOT / "port/dreamcast/game/platform/include"),
+                        str(cpp), "-o", str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
 
 
